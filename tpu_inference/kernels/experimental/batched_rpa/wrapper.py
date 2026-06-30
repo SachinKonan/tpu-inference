@@ -150,9 +150,6 @@ def get_kv_cache_shape(
         "use_causal_mask",
         "update_kv_cache",
     ),
-    # Donation of transient inputs can fail for some runtime buffer layouts in
-    # the experimental tuning path. Keep donation only for kv_cache, which is
-    # the intended long-lived mutable state.
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
 def ragged_paged_attention(
