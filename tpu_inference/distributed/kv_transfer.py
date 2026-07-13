@@ -289,6 +289,16 @@ def _async_copy_jit(
     if was_padded:
         dest_out_list = [x[..., :orig_shape[-1]] for x in dest_out_list]
 
+    if len(dest_out_list) == 1:
+        # With a single cache (the unified block-major pool), the donated
+        # dest flows through the DMA kernels straight to the jit output and
+        # XLA buffer assignment gives the entry output a different memory
+        # color than the donated parameter, failing the aliasing verifier
+        # ("Different aliasing shapes: ... vs ...S(9)"). The barrier keeps
+        # the donation in place (same buffer, no extra copy) while letting
+        # the output take the default color.
+        dest_out_list = [jax.lax.optimization_barrier(dest_out_list[0])]
+
     return dest_out_list
 
 

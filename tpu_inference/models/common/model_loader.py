@@ -43,6 +43,7 @@ from tpu_inference.models.jax.utils.qwix.qwix_utils import (
     update_vllm_config_for_qwix_quantization)
 from tpu_inference.models.jax.utils.weight_utils import (BaseWeightLoader,
                                                          LoadableWithIterator)
+from tpu_inference.runner.kv_cache import model_uses_unified_kv_cache
 from tpu_inference.runner.mm_encoder_jit_manager import \
     maybe_create_mm_encoder_jit_manager
 from tpu_inference.utils import to_jax_dtype, to_torch_dtype
@@ -352,10 +353,36 @@ def get_flax_model(
                                pooler=pooler,
                                is_draft_model=is_draft_model)
     vllm_config.model_config.dtype = original_dtype
-    kv_cache_sharding = NamedSharding(
-        mesh,
-        PartitionSpec(ShardingAxisName.ATTN_DATA, None,
-                      ShardingAxisName.ATTN_HEAD))
+    # The kv cache out_shardings must be pinned, and to the layout-correct
+    # spec:
+    #
+    # - Pinned, because inference feeds each step's cache outputs into the
+    #   next step's call, so the sharding object is part of the jit cache
+    #   key. With out_shardings=None the inferred output sharding is not
+    #   stable across compiled entries (on TP=1 some entries return
+    #   SingleDeviceSharding), and the first serve-time call of a bucket
+    #   that was precompiled with NamedSharding inputs becomes a cache miss
+    #   (a forbidden recompile under VLLM_XLA_CHECK_RECOMPILATION).
+    #
+    # - Layout-correct, because a PartitionSpec is rank-sensitive (a short
+    #   spec right-pads with None): the rank-3 spec on the rank-6 unified
+    #   pool would land ATTN_HEAD on dim2 (page_size) instead of dim3 (kv
+    #   heads) and force a whole-pool all-to-all reshard at the run_model
+    #   root (~2x pool -> OOM at TP>1). The gate matches the allocation-time
+    #   decision in kv_cache_manager via the shared helper; its extra
+    #   all-attention condition is implied for the allowlisted archs.
+    if model_uses_unified_kv_cache(vllm_config):
+        # Unified block-major pool, rank 6: kv heads on dim3.
+        kv_cache_sharding = NamedSharding(
+            mesh,
+            PartitionSpec(ShardingAxisName.ATTN_DATA, None, None,
+                          ShardingAxisName.ATTN_HEAD))
+    else:
+        # Per-layer caches, rank 5: kv heads on dim2.
+        kv_cache_sharding = NamedSharding(
+            mesh,
+            PartitionSpec(ShardingAxisName.ATTN_DATA, None,
+                          ShardingAxisName.ATTN_HEAD))
     hidden_states_sharding = NamedSharding(mesh,
                                            PartitionSpec(
                                                ShardingAxisName.ATTN_DATA,

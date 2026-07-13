@@ -13,7 +13,7 @@
 # limitations under the License.
 import dataclasses
 import os
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, List, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -46,7 +46,9 @@ from tpu_inference.offload.utils import get_kv_connector_cache_layout
 from tpu_inference.runner import utils as runner_utils
 from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
 from tpu_inference.runner.kv_cache import (KVCacheMetadata, create_kv_caches,
-                                           get_attention_page_size_bytes)
+                                           create_unified_kv_cache,
+                                           get_attention_page_size_bytes,
+                                           model_uses_unified_kv_cache)
 
 if TYPE_CHECKING:
     from vllm.v1.request import Request
@@ -71,6 +73,37 @@ def is_ds_v4(vllm_config):
     return "DeepseekV4ForCausalLM" in (vllm_config.model_config.architectures)
 
 
+def _unpack_kv_caches(kv_caches: List[Any], attn_flat_indices: Tuple[int, ...],
+                      num_total_caches: int) -> List[Any]:
+    """Rebuild a per-layer KV cache list from the unified block-major array.
+
+    Attention layers are stored in a single block-major array so a block's
+    all-layer data is contiguous, which lets the Raiden connector DMA it
+    directly off ``runner.kv_caches`` with no per-layer unpacking.
+
+    This helper is the compatibility path for everything that still expects
+    a per-layer list -- notably the in-engine JAX KV transfer used when
+    prefill hands a request's cache to decode (and its warmup). It slices the
+    unified array back into per-layer views by flat index; it does not copy.
+    When there is no unified array (attn_flat_indices empty) it is a no-op.
+
+    TODO: only attention layers live in the unified array today. Hybrid
+    (attention+Mamba) models are not yet supported here -- they take the
+    legacy per-layer path via the allowlist gate. When that support lands,
+    unpack the per-Mamba-layer caches (kv_caches[1:]) back into their slots.
+    """
+    if not attn_flat_indices:
+        return kv_caches
+
+    large_attn_cache = kv_caches[0]
+    unpacked = [None] * num_total_caches
+    for i, flat_idx in enumerate(attn_flat_indices):
+        # 6D block-major pool (num_blocks, num_layers, ...): layer i's
+        # per-layer (num_blocks, ...) view is the dim1 slice.
+        unpacked[flat_idx] = large_attn_cache[:, i]
+    return unpacked
+
+
 class KVCacheManager:
 
     def __init__(self, runner: "TPUModelRunner"):
@@ -81,6 +114,12 @@ class KVCacheManager:
         # from the KV cache of `shared_kv_cache_layers[layer_name]`.
         self.shared_kv_cache_layers: dict[str, str] = {}
         self.use_mla = self.runner.model_config.use_mla
+        # Unified block-major pool metadata, populated by initialize_kv_cache
+        # when the unified path is taken. The empty defaults mean "per-layer
+        # semantics" so every consumer (e.g. _unpack_kv_caches) is a no-op
+        # pass-through for callers that never run the unified allocation.
+        self.attn_flat_indices: Tuple[int, ...] = ()
+        self.num_total_caches: int = 0
         # Set by `update_mamba_page_size_padded` for hybrid attention+mamba
         # models. When set, every attention layer spec reports this as its
         # `page_size_padded` so vLLM sees a uniform page size across groups
@@ -775,6 +814,36 @@ class KVCacheManager:
                             ) == num_shared_layers, f"Expected all non-MTP kv_cache_tensors to have the same number of shared layers {num_shared_layers}, but found {len(kv_cache_tensor.shared_by)}"
                     break
 
+        # Classify tensors and calculate flat indices
+        attn_specs = []
+        attn_flat_indices = []
+        flat_idx = 0
+
+        num_shared_layers = 1
+        if kv_cache_config.kv_cache_tensors:
+            num_shared_layers = len(
+                kv_cache_config.kv_cache_tensors[0].shared_by)
+
+        # Whether to allocate the unified block-major KV cache: the config
+        # must pass the shared gate (allowlisted arch, no spec decode; see
+        # model_uses_unified_kv_cache, which model_loader also uses to pick
+        # the matching kv cache out_shardings pin) AND all layers must be
+        # regular attention -- the unified pool holds one homogeneous
+        # attention group, so any Mamba/hybrid layout keeps the per-layer
+        # path even if the arch name matches (configs can pair an allowlisted
+        # arch with Mamba specs).
+        #
+        # No TP gate: the unified pool is a 6D block-major array whose fold to
+        # the kernel's 5D cache happens per-device inside attention's
+        # shard_map (a bitcast), so nothing in the GSPMD graph reshapes or
+        # reshards it. That keeps it correct at any TP (no relayout at TP=1,
+        # no all-to-all reshard at TP>1).
+        has_mamba_layers = any(
+            isinstance(spec, MambaSpec)
+            for spec in layer_name_to_spec.values())
+        use_unified = (model_uses_unified_kv_cache(self.runner.vllm_config)
+                       and not has_mamba_layers)
+
         for i, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
             if duplicate_shared_layers:
                 total_group_page_size = 0
@@ -843,6 +912,24 @@ class KVCacheManager:
                 self.actual_mamba_num_blocks = mamba_num_blocks
 
             for j, layer_name in enumerate(kv_cache_tensor.shared_by):
+                if use_unified:
+                    # Pass 1: record one flat index per shared group (layers
+                    # that share a tensor reuse the same slot, so only the
+                    # first one allocates); the single block-major array is
+                    # allocated after the tensor loop. The gate guarantees
+                    # regular attention here, so this is always j == 0 on an
+                    # attention spec.
+                    # TODO: handle Mamba-layer KV cache allocation in the
+                    # block-major path once it is extended to hybrid models.
+                    # For now Mamba/hybrid models are routed to the per-layer
+                    # path below by the use_unified gate.
+                    if j == 0:
+                        attn_specs.append(
+                            (flat_idx, layer_name_to_spec[layer_name],
+                             num_blocks))
+                        attn_flat_indices.append(flat_idx)
+                        flat_idx += 1
+                    continue
                 layer_spec = layer_name_to_spec[layer_name]
                 if isinstance(layer_spec, MambaSpec):
                     mamba_states = []
@@ -966,6 +1053,81 @@ class KVCacheManager:
                 layer_idx = (i * num_shared_layers
                              ) + j if duplicate_shared_layers else i
                 self.runner.layer_name_to_kvcache_index[layer_name] = layer_idx
+
+        if use_unified:
+            self.attn_flat_indices = tuple(attn_flat_indices)
+            self.num_total_caches = flat_idx
+
+            kv_caches = []
+            num_blocks_list = []
+
+            # Allocate unified attention cache if we have any
+            if attn_specs:
+                first_flat_idx, first_spec, first_num_blocks = attn_specs[0]
+                # Verify all attention layers have the same spec
+                for fid, spec, nblocks in attn_specs:
+                    assert spec.block_size == first_spec.block_size
+                    assert spec.num_kv_heads == first_spec.num_kv_heads
+                    assert spec.head_size == first_spec.head_size
+                    assert spec.dtype == first_spec.dtype
+                    assert nblocks == first_num_blocks
+
+                if self.use_mla:
+                    head_size = \
+                        self.runner.model_config.hf_config.kv_lora_rank + \
+                        self.runner.model_config.hf_config.qk_rope_head_dim
+                else:
+                    head_size = first_spec.head_size
+
+                logger.info(
+                    f"Allocating unified KV cache for {len(attn_specs)} "
+                    f"attention layers. "
+                    f"Shape: ({first_num_blocks}, {len(attn_specs)}, ...)")
+
+                unified_cache = create_unified_kv_cache(
+                    num_blocks=first_num_blocks,
+                    block_size=first_spec.block_size,
+                    num_kv_heads=first_spec.num_kv_heads,
+                    head_size=head_size,
+                    mesh=self.runner.mesh,
+                    num_layers=len(attn_specs),
+                    cache_dtype=t2j_dtype(first_spec.dtype),
+                    use_mla=self.use_mla,
+                )
+                kv_caches.append(unified_cache)
+                num_blocks_list.append(first_num_blocks)
+
+                # Update Regular Attention Metadata
+                metadata["regular_attn"].count = len(attn_specs)
+                metadata["regular_attn"].shape = unified_cache.shape
+                metadata["regular_attn"].dtype = unified_cache.dtype
+                metadata["regular_attn"].sharding = unified_cache.sharding
+
+            # TODO: hybrid (attention+Mamba) support. The unified block-major
+            # path currently holds attention layers only; hybrid models take
+            # the legacy per-layer path via the allowlist gate. To extend it,
+            # allocate one cache per Mamba layer after the unified attention
+            # array (kv_caches[1:]) and reintroduce a Mamba flat-index mapping
+            # so _unpack_kv_caches / _jitted_insert_continuous_kv_cache_from_slice
+            # and the vLLM Pallas backend can address those slots.
+
+            self.runner.kv_caches = kv_caches
+
+            # Pass 2: Set up layer_name_to_kvcache_index mapping
+            for i, kv_cache_tensor in enumerate(
+                    kv_cache_config.kv_cache_tensors):
+                for j, layer_name in enumerate(kv_cache_tensor.shared_by):
+                    layer_idx = (i * num_shared_layers
+                                 ) + j if duplicate_shared_layers else i
+                    self.runner.layer_name_to_kvcache_index[
+                        layer_name] = layer_idx
+        else:
+            # Legacy per-layer allocation already populated kv_caches and the
+            # layer_name -> index map in the loop above. Leave the flat-index
+            # metadata empty so downstream (attention_interface / flash_attn /
+            # qwen models) falls back to the per-layer path.
+            self.attn_flat_indices = ()
+            self.num_total_caches = 0
         if self.shared_kv_cache_layers:
             for layer_name, target_layer_name in self.shared_kv_cache_layers.items(
             ):
@@ -1137,7 +1299,8 @@ class KVCacheManager:
 
     @staticmethod
     @jax.jit(
-        static_argnames=("block_size", "chunk_size"),
+        static_argnames=("block_size", "chunk_size", "attn_flat_indices",
+                         "num_total_caches"),
         donate_argnames=("kv_caches", ),
     )
     def _jitted_insert_continuous_kv_cache_from_slice(
@@ -1147,16 +1310,40 @@ class KVCacheManager:
         kv_cache_slices: List[jax.Array],
         token_start: int,
         start_block: int,
+        attn_flat_indices: Tuple[int, ...] = (),
+        num_total_caches: int = 0,
     ) -> List[jax.Array]:
         """
         JIT-compiled function that dynamically slices the required tokens from KV cache
         slices and inserts them into continuous physical blocks.
+
+        TODO: hybrid (attention+Mamba) support -- the unified branch below
+        writes attention layers only. When hybrid lands, also write the
+        per-Mamba-layer caches (kv_caches[1:]) from their slices.
         """
+        if not attn_flat_indices:
 
-        def _update_layer(cache, slices):
-            """The function to apply to each layer's cache and slices."""
+            def _update_layer(cache, slices):
+                extracted_slices = jax.lax.dynamic_slice_in_dim(slices,
+                                                                token_start,
+                                                                chunk_size *
+                                                                block_size,
+                                                                axis=0)
+                reshaped_slices = extracted_slices.reshape(
+                    -1, block_size, *slices.shape[1:])
+                return jax.lax.dynamic_update_slice_in_dim(cache,
+                                                           reshaped_slices,
+                                                           start_block,
+                                                           axis=0)
 
-            # Dynamically slice exactly chunk_size * block_size tokens starting at token_start
+            return jax.tree.map(_update_layer, kv_caches, kv_cache_slices)
+
+        # 6D block-major pool (num_blocks, num_layers, ...): a whole layer is
+        # addressed directly with [:, i].
+        new_large_attn_cache = kv_caches[0]
+
+        for i, flat_idx in enumerate(attn_flat_indices):
+            slices = kv_cache_slices[flat_idx]
             extracted_slices = jax.lax.dynamic_slice_in_dim(slices,
                                                             token_start,
                                                             chunk_size *
@@ -1164,13 +1351,13 @@ class KVCacheManager:
                                                             axis=0)
             reshaped_slices = extracted_slices.reshape(-1, block_size,
                                                        *slices.shape[1:])
+            current_slice = new_large_attn_cache[:, i, ...]
+            updated_slice = jax.lax.dynamic_update_slice_in_dim(
+                current_slice, reshaped_slices, start_block, axis=0)
+            new_large_attn_cache = new_large_attn_cache.at[:, i, ...].set(
+                updated_slice)
 
-            return jax.lax.dynamic_update_slice_in_dim(cache,
-                                                       reshaped_slices,
-                                                       start_block,
-                                                       axis=0)
-
-        return jax.tree.map(_update_layer, kv_caches, kv_cache_slices)
+        return [new_large_attn_cache]
 
     def get_kv_cache_for_block_ids(
         self,
@@ -1187,14 +1374,17 @@ class KVCacheManager:
             A list of JAX arrays, with each array representing the KV cache
             slices for a layer, concatenated for all blocks.
         """
+        unpacked_caches = _unpack_kv_caches(self.runner.kv_caches,
+                                            self.attn_flat_indices,
+                                            self.num_total_caches)
         if block_ids == list(range(block_ids[0],
                                    block_ids[0] + len(block_ids))):
             batched_kv_cache_per_layer = self._jitted_gather_continuous_kv_cache(
-                self.runner.kv_caches, block_ids[0], len(block_ids))
+                unpacked_caches, block_ids[0], len(block_ids))
 
         else:
             batched_kv_cache_per_layer = self._jitted_gather_kv_cache(
-                self.runner.kv_caches, jnp.array(block_ids))
+                unpacked_caches, jnp.array(block_ids))
         return batched_kv_cache_per_layer
 
     def transfer_kv_cache(self,
@@ -1284,6 +1474,8 @@ class KVCacheManager:
                     kv_cache_slices,
                     0,
                     start_block,
+                    self.attn_flat_indices,
+                    self.num_total_caches,
                 )
                 jax.block_until_ready(self.runner.kv_caches)
         else:
