@@ -90,16 +90,19 @@ if [[ "${BUILDKITE_PIPELINE_NAME:-}" =~ (kernel-tuning|kernel-autotune) ]]; then
   ENV_VARS+=("${KERNEL_TUNING_ENV_VARS[@]}")
 fi
 
-TEST_SUITE_VARS=(
-  -e BUILDKITE_ANALYTICS_TOKEN="${BUILDKITE_ANALYTICS_TOKEN:-}"
-  -e BUILDKITE_BUILD_ID="${BUILDKITE_BUILD_ID:-}"
-  -e BUILDKITE_BUILD_NUMBER="${BUILDKITE_BUILD_NUMBER:-}"
-  -e BUILDKITE_JOB_ID="${BUILDKITE_JOB_ID:-}"
-  -e BUILDKITE_BRANCH="${BUILDKITE_BRANCH:-}"
-  -e BUILDKITE_COMMIT="${BUILDKITE_COMMIT:-}"
-  -e BUILDKITE_MESSAGE="${BUILDKITE_MESSAGE:-}"
-  -e BUILDKITE_BUILD_URL="${BUILDKITE_BUILD_URL:-}"
-)
+# Buildkite and test suite related environment variables and volume mounts
+export BUILDKITE_PARALLEL_JOB="${BUILDKITE_PARALLEL_JOB:-0}"
+export BUILDKITE_PARALLEL_JOB_COUNT="${BUILDKITE_PARALLEL_JOB_COUNT:-1}"
+
+TEST_SUITE_VARS=()
+while IFS='=' read -r key _; do
+  if [[ "$key" == BUILDKITE_* ]]; then
+    TEST_SUITE_VARS+=(-e "$key")
+  fi
+done < <(env)
+if [ -n "${BUILDKITE_OIDC_TOKEN_PATH:-}" ]; then
+  TEST_SUITE_VARS+=(-v "$(dirname "${BUILDKITE_OIDC_TOKEN_PATH}"):$(dirname "${BUILDKITE_OIDC_TOKEN_PATH}")")
+fi
 
 DOCKER_HF_HOME="/tmp/hf_home"
 

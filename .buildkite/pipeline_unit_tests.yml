@@ -1,0 +1,79 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Dedicated Unit Tests sub-pipeline.
+# Uploaded from pipeline_jax.yml after generate_test_lists.py exports file patterns.
+
+steps:
+  - label: "${TPU_VERSION:-tpu6e} Unified JAX unit tests - Single Chip"
+    key: ${TPU_VERSION:-tpu6e}_test_7
+    agents:
+      queue: ${TPU_QUEUE_SINGLE:-tpu_v6e_queue}
+    parallelism: 4
+    artifact_paths: ".coverage.part*.${TPU_VERSION:-tpu6e}"
+    commands:
+      - rm -f .coverage.part_$$BUILDKITE_PARALLEL_JOB.${TPU_VERSION:-tpu6e}
+      - .buildkite/scripts/run_in_docker.sh bktec run
+      - cp /mnt/disks/persist/models/.coverage.part_$$BUILDKITE_PARALLEL_JOB.${TPU_VERSION:-tpu6e} ./ 2>/dev/null || true
+    plugins:
+      - tests#v1.0.0:
+          suite-slug: "tests"
+          test-runner: "pytest"
+          install-client: false
+          oidc-lifetime: 7200
+          test-file-pattern: "${SINGLE_CHIP_PATTERNS}"
+          test-file-exclude-pattern: "${SINGLE_CHIP_EXCLUDES}"
+          test-cmd: "bash -c 'python3 -m pytest -s -v -x --cov-config=/workspace/tpu_inference/.coveragerc --cov tpu_inference --junit-xml={{resultPath}} {{testExamples}}; if [ -f .coverage ]; then cp .coverage /tmp/hf_home/.coverage.part_$$BUILDKITE_PARALLEL_JOB.${TPU_VERSION:-tpu6e}; else exit 1; fi'"
+
+  - label: "${TPU_VERSION:-tpu6e} Unified JAX unit tests - Multi Chip"
+    key: ${TPU_VERSION:-tpu6e}_test_13
+    agents:
+      queue: ${TPU_QUEUE_MULTI:-tpu_v6e_8_queue}
+    artifact_paths: ".coverage.part*.${TPU_VERSION:-tpu6e}"
+    commands:
+      - rm -f .coverage.part_$$BUILDKITE_PARALLEL_JOB\_multi.${TPU_VERSION:-tpu6e}
+      - .buildkite/scripts/run_in_docker.sh bktec run
+      - cp /mnt/disks/persist/models/.coverage.part_$$BUILDKITE_PARALLEL_JOB\_multi.${TPU_VERSION:-tpu6e} ./ 2>/dev/null || true
+    plugins:
+      - tests#v1.0.0:
+          suite-slug: "tests"
+          test-runner: "pytest"
+          install-client: false
+          oidc-lifetime: 7200
+          test-file-pattern: "${MULTI_CHIP_PATTERNS}"
+          test-cmd: "bash -c 'TEST_LORA_TP=True USE_V6E8_QUEUE=True VLLM_LOG_LEVEL=INFO MODEL_IMPL_TYPE=vllm TPU_BACKEND_TYPE=jax python3 -m pytest -s -v -x --cov-config=/workspace/tpu_inference/.coveragerc --cov tpu_inference --junit-xml={{resultPath}} {{testExamples}}; if [ -f .coverage ]; then cp .coverage /tmp/hf_home/.coverage.part_$$BUILDKITE_PARALLEL_JOB\_multi.${TPU_VERSION:-tpu6e}; else exit 1; fi'"
+
+  - label: "${TPU_VERSION:-tpu6e} JAX unit tests combine and report"
+    depends_on:
+      - "${TPU_VERSION:-tpu6e}_test_7"
+      - "${TPU_VERSION:-tpu6e}_test_13"
+    key: ${TPU_VERSION:-tpu6e}_test_7_combine
+    agents:
+      queue: cpu
+    commands:
+      - "buildkite-agent artifact download \".coverage.part*\" ."
+      - curl -L https://github.com/pantsbuild/pex/releases/download/v2.1.151/pex -o pex
+      - chmod +x pex
+      - python3 ./pex coverage -c coverage -o coverage.pex
+      - |
+        echo "[paths]" > .coveragerc
+        echo "source =" >> .coveragerc
+        echo "    ." >> .coveragerc
+        echo "    /workspace/tpu_inference/" >> .coveragerc
+      - |
+        python3 ./coverage.pex combine .coverage.part*.${TPU_VERSION:-tpu6e}
+        python3 ./coverage.pex report --fail-under=${COV_FAIL_UNDER:-68}
+        EXIT_CODE=$?
+        rm -f .coverage.part* .coveragerc pex coverage.pex .coverage
+        exit $EXIT_CODE
