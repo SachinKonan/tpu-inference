@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
+from functools import partial
 from typing import List
 
 import jax
@@ -96,6 +97,18 @@ def get_kv_cache_shape_with_mesh(mesh: Mesh,
     return tuple(shape)
 
 
+@partial(jax.jit, static_argnums=(0, 1, 2))
+def _allocate(cache_shape: tuple, cache_dtype: jnp.dtype,
+              sharding: NamedSharding) -> jax.Array:
+    return jax.lax.with_sharding_constraint(
+        jnp.zeros(
+            shape=cache_shape,
+            dtype=cache_dtype,
+        ),
+        sharding,
+    )
+
+
 def create_kv_caches(
     num_blocks: int,
     block_size: int,
@@ -146,16 +159,9 @@ def create_kv_caches(
             PartitionSpec(ShardingAxisName.BATCH, ShardingAxisName.CONTEXT,
                           ShardingAxisName.KV_CACHE_HEAD))
 
-    def _allocate() -> jax.Array:
-        return jnp.zeros(
-            shape=cache_shape,
-            dtype=cache_dtype,
-        )
-
-    sharded_allocate = jax.jit(_allocate, out_shardings=sharding)
     kv_caches = []
     for _ in layer_names:
-        kv_caches.append(sharded_allocate())
+        kv_caches.append(_allocate(cache_shape, cache_dtype, sharding))
     return kv_caches
 
 
