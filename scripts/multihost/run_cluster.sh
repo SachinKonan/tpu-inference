@@ -139,11 +139,18 @@ if [ -d "/mnt/disks/checkpoint" ]; then
     CHECKPOINT_MOUNT_ARGS+=(-v "/mnt/disks/checkpoint:/mnt/disks/checkpoint")
 fi
 
+# -----------------------------------------------------------------------------
+# Docker Options Explanation:
+# - log-opt: Limits log file size and count to prevent excessive logging 
+#   from Ray/vLLM from exhausting VM disk space and causing node failures.
+# -----------------------------------------------------------------------------
 docker run \
     --privileged \
     --entrypoint /bin/bash \
     --network host \
     --shm-size=16G \
+    --log-opt max-size=50m \
+    --log-opt max-file=2 \
     --name "${CONTAINER_NAME}" \
     -v "${PATH_TO_HF_HOME}:/root/.cache/huggingface" \
     "${GCLOUD_MOUNT_ARGS[@]}" \
