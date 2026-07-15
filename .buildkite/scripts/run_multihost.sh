@@ -321,7 +321,7 @@ bash "${TOP_DIR}/scripts/multihost/run_cluster.sh" \
   "${HOST_HF_HOME}" \
   -e HF_TOKEN="${HF_TOKEN:-}" \
   -e TPU_MULTIHOST_BACKEND=ray \
-  -e JAX_PLATFORMS='tpu,cpu' \
+  -e JAX_PLATFORMS='' \
   -e TPU_BACKEND_TYPE=jax \
   -e MODEL_IMPL_TYPE="${MODEL_IMPL_TYPE:-vllm}" \
   -e VLLM_DISABLE_SHARED_EXPERTS_STREAM="${VLLM_DISABLE_SHARED_EXPERTS_STREAM:-1}" \
