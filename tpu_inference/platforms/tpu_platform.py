@@ -119,6 +119,8 @@ class TpuPlatform(Platform):
         "TPU_CHIPS_PER_HOST_BOUNDS",
         "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND",
+        "VLLM_XLA_CACHE_PATH",
+        "SKIP_JAX_PRECOMPILE",
         "VLLM_MLA_DISABLE",
         "TPU_BACKEND_TYPE",
         "NEW_MODEL_DESIGN",
