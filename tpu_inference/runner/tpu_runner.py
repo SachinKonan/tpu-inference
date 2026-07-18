@@ -128,6 +128,78 @@ INVALID_TOKEN_ID = -1
 # Smallest output size
 MIN_NUM_SEQS = 8
 
+# Slot indices into the fused-MoE w13 tensor's second axis, whose
+# post-processed layout is (num_experts, 2, hidden_pad, intermediate_pad).
+# Slot 0 holds the gate projection (w1 / wi_0) and slot 1 the up projection
+# (w3 / wi_1) per the FUSED_MOE post-processing order.
+# TODO-verify: empirical verification may swap these two indices.
+W13_GATE_SLOT = 0
+W13_UP_SLOT = 1
+
+
+def _group_moe_lora_factors(factors):
+    """Group flat MoE LoRA factor dicts by (layer, component).
+
+    Keys look like ``layers.{i}.{component}.{lora_a|lora_b}`` with components
+    in {wi_0, wi_1, wo, router}. Returns
+    ``{(layer_idx, component): {"lora_a": arr, "lora_b": arr}}``.
+    """
+    groups: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    if not factors:
+        return groups
+    for key, value in factors.items():
+        parts = key.split(".")
+        if (len(parts) != 4 or parts[0] != "layers" or not parts[1].isdigit()
+                or parts[3] not in ("lora_a", "lora_b")):
+            logger.warning(
+                "MoE LoRA merge: skipping unrecognized factor key %r "
+                "(expected 'layers.{i}.{component}.{lora_a|lora_b}')", key)
+            continue
+        groups.setdefault((int(parts[1]), parts[2]), {})[parts[3]] = value
+    return groups
+
+
+def _compute_moe_lora_delta(component, lora_a, lora_b, scale):
+    """Compute the dense f32 LoRA delta for one MoE component.
+
+    Shapes (H=hidden, I=intermediate, E=num experts, r=rank):
+      wi_0/wi_1: A (H, r), B (r, E, I) -> delta (E, H, I)
+      wo:        A (E, I, r), B (r, H) -> delta (E, I, H)
+      router:    A (H, r), B (r, E)    -> delta (E, H)
+    """
+    a = jnp.asarray(np.asarray(lora_a), dtype=jnp.float32)
+    b = jnp.asarray(np.asarray(lora_b), dtype=jnp.float32)
+    if component in ("wi_0", "wi_1"):
+        return scale * jnp.einsum("dr,ref->edf", a, b)
+    if component == "wo":
+        return scale * jnp.einsum("efr,rd->efd", a, b)
+    if component == "router":
+        return scale * (a @ b).T
+    logger.warning("MoE LoRA merge: unknown component %r; skipping.",
+                   component)
+    return None
+
+
+def _find_moe_state_key(state, layer_idx, token, require_weight_suffix=False):
+    """Find the unique state-dict key for ``layer_idx`` containing ``token``.
+
+    Returns None (after logging near-miss keys) unless exactly one key
+    matches, so a missing/ambiguous component is skipped rather than
+    corrupting an unrelated weight.
+    """
+    layer_tag = f"layers.{layer_idx}."
+    matches = [k for k in state if layer_tag in k and token in k]
+    if require_weight_suffix:
+        matches = [k for k in matches if k.endswith(".weight")]
+    if len(matches) == 1:
+        return matches[0]
+    near_miss = sorted(k for k in state if layer_tag in k)[:20]
+    logger.warning(
+        "MoE LoRA merge: expected exactly one state key for layer %d "
+        "matching %r but found %s; near-miss keys for this layer: %s",
+        layer_idx, token, matches, near_miss)
+    return None
+
 
 @functools.partial(jax.jit, static_argnames=["dp_size", "tokens_per_dp"])
 def _compute_active_mask(
@@ -2663,6 +2735,150 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             self.state_leaves = tuple(jax.tree_util.tree_leaves(self.state))
         else:
             self.state_leaves = self.state
+
+    def _apply_moe_lora_deltas(self, factors, meta):
+        """For RL framework integration: merge MoE LoRA deltas into the base
+        expert (and router) weights of a fused-MoE model (single-tenant).
+
+        ``factors`` is a flat dict of numpy f32 arrays keyed like
+        ``layers.{i}.{wi_0|wi_1|wo|router}.{lora_a|lora_b}`` (see
+        ``_compute_moe_lora_delta`` for shapes); ``meta`` carries ``scale``.
+
+        Incremental semantics: ``new_state = state + delta(new) - delta(prev)``
+        where ``prev`` is the factor dict from the previous call (None on the
+        first call, i.e. plain add). This keeps the merged weights equal to
+        ``base + delta(latest factors)`` without a pristine copy of the base.
+        """
+        # State values on the vllm/torchax path are jax views of torch params
+        # (see vllm_model_wrapper.load_weights / lora_utils.set_active_loras);
+        # unwrap defensively in case a torchax tensor view leaks through.
+        from torchax.interop import jax_view, torch_view
+
+        if isinstance(self.state, nnx.State) or not isinstance(
+                self.state, dict):
+            raise RuntimeError(
+                "_apply_moe_lora_deltas only supports the vLLM (dict-state) "
+                f"model path; got state of type {type(self.state)}")
+
+        scale = float(meta["scale"])
+        prev = getattr(self, "_moe_lora_prev", None)
+        prev_scale = float(getattr(self, "_moe_lora_prev_scale", scale))
+        incremental = prev is not None
+
+        new_groups = _group_moe_lora_factors(factors)
+        prev_groups = _group_moe_lora_factors(prev)
+
+        def _delta_or_none(groups, layer_comp, delta_scale):
+            ab = groups.get(layer_comp)
+            if not ab:
+                return None
+            if "lora_a" not in ab or "lora_b" not in ab:
+                logger.warning(
+                    "MoE LoRA merge: layer %d component %r is missing "
+                    "lora_a or lora_b; skipping it.", layer_comp[0],
+                    layer_comp[1])
+                return None
+            return _compute_moe_lora_delta(layer_comp[1], ab["lora_a"],
+                                           ab["lora_b"], delta_scale)
+
+        updates: Dict[str, jax.Array] = {}
+        original_sharding: Dict[str, Any] = {}
+        was_torch_view: Dict[str, bool] = {}
+        touched_layers = set()
+
+        # Union so components dropped from the new factors get un-merged.
+        for layer_comp in sorted(set(new_groups) | set(prev_groups)):
+            layer_idx, component = layer_comp
+            delta_new = _delta_or_none(new_groups, layer_comp, scale)
+            delta_old = _delta_or_none(prev_groups, layer_comp, prev_scale)
+            if delta_new is None and delta_old is None:
+                continue
+            if delta_new is None:
+                inc = -delta_old
+            elif delta_old is None:
+                inc = delta_new
+            else:
+                if delta_new.shape != delta_old.shape:
+                    logger.warning(
+                        "MoE LoRA merge: layer %d component %r delta shape "
+                        "changed %s -> %s across calls; cannot merge "
+                        "incrementally, skipping it.", layer_idx, component,
+                        delta_old.shape, delta_new.shape)
+                    continue
+                # Increment computed in f32 BEFORE the single cast on add.
+                inc = delta_new - delta_old
+
+            if component in ("wi_0", "wi_1"):
+                key = _find_moe_state_key(self.state, layer_idx, "w13_weight")
+                slot = W13_GATE_SLOT if component == "wi_0" else W13_UP_SLOT
+                num_experts, hidden, intermediate = inc.shape
+                index = (slice(None), slot, slice(0, hidden),
+                         slice(0, intermediate))
+                # Padded fused layout (E, 2, H_pad, I_pad).
+                shape_ok = lambda s: (len(s) == 4 and s[0] == num_experts and
+                                      s[2] >= hidden and s[3] >= intermediate)
+            elif component == "wo":
+                key = _find_moe_state_key(self.state, layer_idx, "w2_weight")
+                num_experts, intermediate, hidden = inc.shape
+                index = (slice(None), slice(0, intermediate), slice(0, hidden))
+                # Padded layout (E, I_pad, H_pad).
+                shape_ok = lambda s: (len(s) == 3 and s[0] == num_experts and
+                                      s[1] >= intermediate and s[2] >= hidden)
+            elif component == "router":
+                key = _find_moe_state_key(self.state,
+                                          layer_idx,
+                                          "router",
+                                          require_weight_suffix=True)
+                num_experts, hidden = inc.shape
+                index = (slice(0, num_experts), slice(0, hidden))
+                # Router weight is (E, H): delta = (A @ B).T.
+                shape_ok = lambda s: (len(s) == 2 and s[0] >= num_experts and
+                                      s[1] >= hidden)
+            else:
+                continue
+            if key is None:
+                continue
+
+            if key in updates:
+                arr = updates[key]
+            else:
+                raw = self.state[key]
+                was_torch_view[key] = isinstance(raw, torch.Tensor)
+                arr = jax_view(raw) if was_torch_view[key] else raw
+                original_sharding[key] = arr.sharding
+            if not shape_ok(arr.shape):
+                logger.warning(
+                    "MoE LoRA merge: layer %d component %r delta shape %s "
+                    "does not fit state array %r of shape %s; skipping it.",
+                    layer_idx, component, inc.shape, key, arr.shape)
+                continue
+
+            # bf16 add of the f32-computed increment: one rounding, and
+            # at[].add preserves the (expert-sharded) layout of `arr`.
+            updates[key] = arr.at[index].add(inc.astype(arr.dtype))
+            touched_layers.add(layer_idx)
+
+        for key, updated in updates.items():
+            # at[].add preserves sharding; device_put is a no-op safeguard.
+            updated = jax.device_put(updated, original_sharding[key])
+            self.state[key] = (torch_view(updated)
+                               if was_torch_view[key] else updated)
+
+        # Keep the dispatch-side view in sync with the updated state so
+        # subsequent jit dispatches see the new weights (mirrors
+        # _sync_weights).
+        if isinstance(self.state, nnx.State):
+            self.state_leaves = tuple(jax.tree_util.tree_leaves(self.state))
+        else:
+            self.state_leaves = self.state
+
+        self._moe_lora_prev = factors
+        self._moe_lora_prev_scale = scale
+        logger.info(
+            "MoE LoRA merge: applied deltas to %d layer(s) "
+            "(incremental=%s, scale=%s).", len(touched_layers), incremental,
+            scale)
+        return {"layers": len(touched_layers), "incremental": incremental}
 
     def _get_padded_total_tokens(
             self, scheduler_output: "VllmSchedulerOutput") -> int:
