@@ -16,9 +16,14 @@ import re
 from typing import List, Optional
 
 import torchax
+from vllm.lora.model_manager import LRUCacheLoRAModelManager
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
+from vllm.model_executor.layers.fused_moe import FusedMoE
 
 from tpu_inference import envs
+from tpu_inference.logger import init_logger
+
+logger = init_logger(__name__)
 
 # MaxText/Pax style name to HuggingFace/vLLM canonical target module mapping.
 # This mapping is hardcoded to keep tpu-inference self-contained and avoid
@@ -40,11 +45,45 @@ LORA_GROUP_PATTERN = re.compile(r'\(([^)]+)\)')
 LORA_SPLIT_PATTERN = re.compile(r'[,|]')
 
 
+class TPULRUCacheLoRAModelManager(LRUCacheLoRAModelManager):
+    """LRU-cache LoRA model manager that skips fused-MoE layers on TPU.
+
+    vLLM's FusedMoEWithLoRA requires the modular-kernel flow: it calls
+    quant_method.select_gemm_impl() (which TPU monolithic quant methods such
+    as VllmUnquantizedFusedMoEMethod / VllmMxfp4MoEMethod do not implement --
+    the base classes raise ValueError) and then swaps the layer's quant
+    method for FusedMoEModularMethod, which has no apply_monolithic() and
+    would break the TPU JAX execution path even if construction succeeded.
+
+    Expert LoRA on TPU is instead applied by merging deltas directly into
+    the base fused-expert weights via the apply_moe_lora_deltas worker RPC,
+    so the PEFT-style wrapper is skipped here.
+    """
+
+    def _match_target_modules(self, module_name: str) -> bool:
+        if not super()._match_target_modules(module_name):
+            return False
+        try:
+            module = self.model.get_submodule(module_name)
+        except AttributeError:
+            return True
+        if isinstance(module, FusedMoE):
+            logger.warning_once(
+                "Skipping LoRA wrapping for fused-MoE module(s) (e.g. %s): "
+                "FusedMoE LoRA adapters are not supported on TPU. Expert "
+                "LoRA is applied via merge-on-load (apply_moe_lora_deltas).",
+                module_name)
+            return False
+        return True
+
+
 class TPULRUCacheWorkerLoRAManager(LRUCacheWorkerLoRAManager):
     """
-    TPU-specific wrapper to ensure dummy LoRA creation happens 
+    TPU-specific wrapper to ensure dummy LoRA creation happens
     within the torchax environment.
     """
+
+    _manager_cls: type[LRUCacheLoRAModelManager] = TPULRUCacheLoRAModelManager
 
     def add_dummy_lora(self, lora_request, rank: int) -> bool:
         with torchax.default_env():
