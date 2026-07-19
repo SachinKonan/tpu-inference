@@ -159,25 +159,118 @@ def _group_moe_lora_factors(factors):
     return groups
 
 
+def _resolve_moe_lora_factors(factors):
+    """Resolve RPC-provided MoE LoRA factors to ``{key: np.float32 array}``.
+
+    Accepts:
+      - ``str``: worker-local path to a safetensors file (the preferred wire
+        format — the API frontend and the EngineCore share a host, so only
+        the path crosses the msgpack RPC hop; ndarray args do NOT survive
+        that hop untyped, they arrive as raw (dtype, shape, buffer) triples).
+      - ``dict``: values may be ndarrays or msgpack-decoded nested lists.
+      - ``None`` (passed through).
+    """
+    if factors is None:
+        return None
+    if isinstance(factors, str):
+        from safetensors.numpy import load_file
+        return load_file(factors)
+    return {k: np.asarray(v, dtype=np.float32) for k, v in factors.items()}
+
+
 def _compute_moe_lora_delta(component, lora_a, lora_b, scale):
-    """Compute the dense f32 LoRA delta for one MoE component.
+    """Compute the dense f32 LoRA delta for one MoE component ON THE HOST.
+
+    numpy (not jnp) on purpose: a 20B gpt-oss push carries ~100 components
+    whose f32 deltas are ~1 GiB each. Computing them on-device exhausted HBM
+    (the serving process preallocates nearly all of it); host BLAS matmuls
+    keep the device footprint at a single component's cast increment.
 
     Shapes (H=hidden, I=intermediate, E=num experts, r=rank):
       wi_0/wi_1: A (H, r), B (r, E, I) -> delta (E, H, I)
       wo:        A (E, I, r), B (r, H) -> delta (E, I, H)
       router:    A (H, r), B (r, E)    -> delta (E, H)
     """
-    a = jnp.asarray(np.asarray(lora_a), dtype=jnp.float32)
-    b = jnp.asarray(np.asarray(lora_b), dtype=jnp.float32)
+    a = np.asarray(lora_a, dtype=np.float32)
+    b = np.asarray(lora_b, dtype=np.float32)
     if component in ("wi_0", "wi_1"):
-        return scale * jnp.einsum("dr,ref->edf", a, b)
+        r, e, f = b.shape
+        d = a.shape[0]
+        out = (scale * a) @ b.reshape(r, e * f)  # (d, e*f) single BLAS call
+        return np.swapaxes(out.reshape(d, e, f), 0, 1)  # (e, d, f) view
     if component == "wo":
-        return scale * jnp.einsum("efr,rd->efd", a, b)
+        e, f, r = a.shape
+        out = (scale * a.reshape(e * f, r)) @ b  # (e*f, d) single BLAS call
+        return out.reshape(e, f, b.shape[1])
     if component == "router":
-        return scale * (a @ b).T
+        return ((scale * a) @ b).T
     logger.warning("MoE LoRA merge: unknown component %r; skipping.",
                    component)
     return None
+
+
+@functools.partial(jax.jit,
+                   static_argnames=("starts", ),
+                   donate_argnums=(0, ))
+def _moe_slice_add_donated(arr, inc, starts):
+    """``arr[starts : starts + inc.shape] += inc`` with ``arr`` donated.
+
+    Donation makes XLA reuse ``arr``'s buffer for the output, so merging
+    into every fused expert tensor of a large MoE keeps HBM at steady state
+    instead of briefly holding old+new copies of ~40 GB of expert weights
+    (which cannot fit next to the serving preallocation). The pre-donation
+    jax.Array handles become invalid, but the only live consumers of these
+    weights are the runner's ``state``/``state_leaves`` dict entries, which
+    the caller replaces immediately; the torch module's parameters are never
+    read after load (forward passes take weights via functional_call from
+    ``state_leaves``).
+    """
+    idx = tuple(slice(s, s + n) for s, n in zip(starts, inc.shape))
+    return arr.at[idx].add(inc.astype(arr.dtype))
+
+
+def _moe_lora_component_placement(component, inc, arr):
+    """Locate ``component``'s unpadded block inside state array ``arr``.
+
+    Returns ``(inc_to_send, starts)`` or ``(None, None)`` if the delta does
+    not fit. Supported fused w13 layouts:
+      - 3-D ``(E, H_pad, 2*I_pad)``: gate/up halves concatenated
+        (uninterleaved, w1/gate first) along the last axis — the actual
+        vllm/torchax post-processed layout (each half padded to I_pad, then
+        concatenated, then swapaxes(1, 2); see
+        layers/common/process_weights/moe_weights.py).
+      - 4-D ``(E, 2, H_pad, I_pad)``: gate/up stacked on axis 1
+        (W13_GATE_SLOT / W13_UP_SLOT).
+    """
+    if component in ("wi_0", "wi_1"):
+        slot = W13_GATE_SLOT if component == "wi_0" else W13_UP_SLOT
+        num_experts, hidden, intermediate = inc.shape
+        if arr.ndim == 4:
+            if (arr.shape[0] == num_experts and arr.shape[1] > slot
+                    and arr.shape[2] >= hidden
+                    and arr.shape[3] >= intermediate):
+                return inc[:, None], (0, slot, 0, 0)
+        elif arr.ndim == 3 and arr.shape[-1] % 2 == 0:
+            i_pad = arr.shape[-1] // 2
+            if (arr.shape[0] == num_experts and arr.shape[1] >= hidden
+                    and i_pad >= intermediate):
+                return inc, (0, 0, slot * i_pad)
+        return None, None
+    if component == "wo":
+        num_experts, intermediate, hidden = inc.shape
+        # Padded layout (E, I_pad, H_pad).
+        if (arr.ndim == 3 and arr.shape[0] == num_experts
+                and arr.shape[1] >= intermediate and arr.shape[2] >= hidden):
+            return inc, (0, 0, 0)
+        return None, None
+    if component == "router":
+        num_experts, hidden = inc.shape
+        # Router weight is (E, H): delta = (A @ B).T.
+        if (arr.ndim == 2 and arr.shape[0] >= num_experts
+                and arr.shape[1] >= hidden):
+            return inc, (0, 0)
+        return None, None
+    return None, None
 
 
 def _find_moe_state_key(state, layer_idx, token, require_weight_suffix=False):
@@ -221,6 +314,14 @@ def apply_moe_lora_deltas_to_state(state,
     merged weights equal to ``base + delta(latest factors)`` without a
     pristine copy of the base.
 
+    Memory discipline (the whole point of this shape of the code): deltas
+    are computed on the HOST in f32, cast to the weight dtype on the host,
+    and applied ONE COMPONENT AT A TIME via a donated-buffer sliced add —
+    peak extra HBM is a single component's increment, regardless of layer
+    count. ``factors``/``prev_factors`` may each be a safetensors path, a
+    dict of ndarrays, or a dict of nested lists (see
+    ``_resolve_moe_lora_factors``).
+
     Returns ``{"layers": <touched layer count>, "incremental": <bool>}``.
     """
     # State values on the vllm/torchax path are jax views of torch params
@@ -232,8 +333,9 @@ def apply_moe_lora_deltas_to_state(state,
     prev_scale = scale if prev_scale is None else float(prev_scale)
     incremental = prev_factors is not None
 
-    new_groups = _group_moe_lora_factors(factors)
-    prev_groups = _group_moe_lora_factors(prev_factors)
+    new_groups = _group_moe_lora_factors(_resolve_moe_lora_factors(factors))
+    prev_groups = _group_moe_lora_factors(
+        _resolve_moe_lora_factors(prev_factors))
 
     def _delta_or_none(groups, layer_comp, delta_scale):
         ab = groups.get(layer_comp)
@@ -247,9 +349,6 @@ def apply_moe_lora_deltas_to_state(state,
         return _compute_moe_lora_delta(layer_comp[1], ab["lora_a"],
                                        ab["lora_b"], delta_scale)
 
-    updates: Dict[str, jax.Array] = {}
-    original_sharding: Dict[str, Any] = {}
-    was_torch_view: Dict[str, bool] = {}
     touched_layers = set()
 
     # Union so components dropped from the new factors get un-merged.
@@ -276,59 +375,37 @@ def apply_moe_lora_deltas_to_state(state,
 
         if component in ("wi_0", "wi_1"):
             key = _find_moe_state_key(state, layer_idx, "w13_weight")
-            slot = W13_GATE_SLOT if component == "wi_0" else W13_UP_SLOT
-            num_experts, hidden, intermediate = inc.shape
-            index = (slice(None), slot, slice(0, hidden),
-                     slice(0, intermediate))
-            # Padded fused layout (E, 2, H_pad, I_pad).
-            shape_ok = lambda s: (len(s) == 4 and s[0] == num_experts and
-                                  s[2] >= hidden and s[3] >= intermediate)
         elif component == "wo":
             key = _find_moe_state_key(state, layer_idx, "w2_weight")
-            num_experts, intermediate, hidden = inc.shape
-            index = (slice(None), slice(0, intermediate), slice(0, hidden))
-            # Padded layout (E, I_pad, H_pad).
-            shape_ok = lambda s: (len(s) == 3 and s[0] == num_experts and
-                                  s[1] >= intermediate and s[2] >= hidden)
         elif component == "router":
             key = _find_moe_state_key(state,
                                       layer_idx,
                                       "router",
                                       require_weight_suffix=True)
-            num_experts, hidden = inc.shape
-            index = (slice(0, num_experts), slice(0, hidden))
-            # Router weight is (E, H): delta = (A @ B).T.
-            shape_ok = lambda s: (len(s) == 2 and s[0] >= num_experts and
-                                  s[1] >= hidden)
         else:
             continue
         if key is None:
             continue
 
-        if key in updates:
-            arr = updates[key]
-        else:
-            raw = state[key]
-            was_torch_view[key] = isinstance(raw, torch.Tensor)
-            arr = jax_view(raw) if was_torch_view[key] else raw
-            original_sharding[key] = arr.sharding
-        if not shape_ok(arr.shape):
+        raw = state[key]
+        is_torch_view = isinstance(raw, torch.Tensor)
+        arr = jax_view(raw) if is_torch_view else raw
+
+        inc_send, starts = _moe_lora_component_placement(component, inc, arr)
+        if inc_send is None:
             logger.warning(
                 "MoE LoRA merge: layer %d component %r delta shape %s "
                 "does not fit state array %r of shape %s; skipping it.",
                 layer_idx, component, inc.shape, key, arr.shape)
             continue
 
-        # bf16 add of the f32-computed increment: one rounding, and
-        # at[].add preserves the (expert-sharded) layout of `arr`.
-        updates[key] = arr.at[index].add(inc.astype(arr.dtype))
+        # bf16 (weight-dtype) cast of the f32-computed increment on the
+        # host: one rounding, one small device transfer. The donated add
+        # reuses arr's buffer and preserves its (expert-sharded) layout.
+        inc_send = np.ascontiguousarray(inc_send).astype(arr.dtype)
+        updated = _moe_slice_add_donated(arr, inc_send, starts)
+        state[key] = torch_view(updated) if is_torch_view else updated
         touched_layers.add(layer_idx)
-
-    for key, updated in updates.items():
-        # at[].add preserves sharding; device_put is a no-op safeguard.
-        updated = jax.device_put(updated, original_sharding[key])
-        state[key] = (torch_view(updated)
-                      if was_torch_view[key] else updated)
 
     return {"layers": len(touched_layers), "incremental": incremental}
 
@@ -2884,6 +2961,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         Thin stateful wrapper around ``apply_moe_lora_deltas_to_state``:
         tracks the previously merged factors/scale on ``self`` and keeps the
         dispatch-side ``state_leaves`` view in sync.
+
+        ``factors`` may be a worker-local safetensors path or a dict of
+        arrays/nested lists; it is resolved HERE (not lazily) because the
+        resolved arrays — never the path, whose contents differ on every
+        push — must be retained as the previous factors for the next
+        incremental merge.
         """
         if isinstance(self.state, nnx.State) or not isinstance(
                 self.state, dict):
@@ -2891,6 +2974,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 "_apply_moe_lora_deltas only supports the vLLM (dict-state) "
                 f"model path; got state of type {type(self.state)}")
 
+        factors = _resolve_moe_lora_factors(factors)
         scale = float(meta["scale"])
         prev = getattr(self, "_moe_lora_prev", None)
         prev_scale = float(getattr(self, "_moe_lora_prev_scale", scale))

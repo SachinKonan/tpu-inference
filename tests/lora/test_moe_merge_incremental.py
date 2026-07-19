@@ -33,6 +33,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import ml_dtypes
 import numpy as np
+import pytest
 
 _REPO_TPU_RUNNER = (Path(__file__).resolve().parents[2] / "tpu_inference" /
                     "runner" / "tpu_runner.py")
@@ -92,12 +93,21 @@ def _router_key(i):
     return f"vllm_model.model.layers.{i}.mlp.router.weight"
 
 
-def _make_state(rng):
-    """bf16 state dict with the padded fused-MoE layouts tpu_runner expects."""
+W13_LAYOUTS = ("3d", "4d")
+
+
+def _make_state(rng, w13_layout="3d"):
+    """bf16 state dict with the padded fused-MoE layouts tpu_runner expects.
+
+    ``w13_layout="3d"`` is the vllm/torchax post-processed layout
+    (E, H_pad, 2*I_pad) with uninterleaved [gate | up] halves; "4d" is the
+    legacy stacked layout (E, 2, H_pad, I_pad).
+    """
     state = {}
     for i in range(NUM_LAYERS):
-        state[_w13_key(i)] = jnp.asarray(rng.standard_normal(
-            (E, 2, H_PAD, I_PAD)),
+        w13_shape = ((E, H_PAD, 2 * I_PAD) if w13_layout == "3d" else
+                     (E, 2, H_PAD, I_PAD))
+        state[_w13_key(i)] = jnp.asarray(rng.standard_normal(w13_shape),
                                          dtype=jnp.bfloat16)
         state[_w2_key(i)] = jnp.asarray(rng.standard_normal((E, I_PAD, H_PAD)),
                                         dtype=jnp.bfloat16)
@@ -174,7 +184,12 @@ def _reference_merged_f64(pristine, factors, scale):
         if comp in ("wi_0", "wi_1"):
             slot = (tpu_runner.W13_GATE_SLOT
                     if comp == "wi_0" else tpu_runner.W13_UP_SLOT)
-            ref[_w13_key(i)][:, slot, :H, :I] += delta
+            w13 = ref[_w13_key(i)]
+            if w13.ndim == 4:
+                w13[:, slot, :H, :I] += delta
+            else:  # 3-D concat layout: half offset = slot * I_pad.
+                off = slot * (w13.shape[-1] // 2)
+                w13[:, :H, off:off + I] += delta
         elif comp == "wo":
             ref[_w2_key(i)][:, :I, :H] += delta
         elif comp == "router":
@@ -233,10 +248,11 @@ def test_delta_math_matches_naive_per_expert_reference():
                                    err_msg=f"component {comp}")
 
 
-def test_single_sync_equals_direct_update():
+@pytest.mark.parametrize("w13_layout", W13_LAYOUTS)
+def test_single_sync_equals_direct_update(w13_layout):
     """One merge from pristine == W0 + delta within bf16 rounding."""
     rng = np.random.default_rng(1)
-    state = _make_state(rng)
+    state = _make_state(rng, w13_layout)
     pristine = _snapshot(state)
     factors = _make_factors(rng)
 
@@ -249,7 +265,8 @@ def test_single_sync_equals_direct_update():
     _assert_close(state, ref, 4, "single sync")
 
 
-def test_incremental_three_syncs_equals_direct_from_pristine():
+@pytest.mark.parametrize("w13_layout", W13_LAYOUTS)
+def test_incremental_three_syncs_equals_direct_from_pristine(w13_layout):
     """THE KEY TEST: F1 -> F2 -> F3 incrementally == pristine + delta(F3).
 
     The incremental path never sees the pristine weights after sync 1: each
@@ -257,7 +274,7 @@ def test_incremental_three_syncs_equals_direct_from_pristine():
     Equivalence must therefore hold up to bf16 rounding only.
     """
     rng = np.random.default_rng(2)
-    state = _make_state(rng)
+    state = _make_state(rng, w13_layout)
     pristine = _snapshot(state)
     f1 = _make_factors(rng)
     f2 = _make_factors(rng)
@@ -307,11 +324,12 @@ def test_incremental_three_syncs_equals_direct_from_pristine():
         "small bf16 rounding differences (one rounding per sync)")
 
 
-def test_dropped_component_is_unmerged():
+@pytest.mark.parametrize("w13_layout", W13_LAYOUTS)
+def test_dropped_component_is_unmerged(w13_layout):
     """Union semantics: a component present in F1 but absent from F2 is
     subtracted back out, leaving its weight at pristine (within rounding)."""
     rng = np.random.default_rng(3)
-    state = _make_state(rng)
+    state = _make_state(rng, w13_layout)
     pristine = _snapshot(state)
     f1 = _make_factors(rng)  # includes router
     f2 = _make_factors(rng, components=("wi_0", "wi_1", "wo"))  # no router
@@ -338,11 +356,12 @@ def test_dropped_component_is_unmerged():
     _assert_close(state, ref, 4, "component drop, surviving components")
 
 
-def test_padding_regions_bit_identical_after_syncs():
-    """The padded tails of w13 (E,2,H_pad,I_pad) and w2 (E,I_pad,H_pad) must
-    never be written: bit-identical to pristine after three syncs."""
+@pytest.mark.parametrize("w13_layout", W13_LAYOUTS)
+def test_padding_regions_bit_identical_after_syncs(w13_layout):
+    """The padded tails of w13 and w2 (E,I_pad,H_pad) must never be
+    written: bit-identical to pristine after three syncs."""
     rng = np.random.default_rng(4)
-    state = _make_state(rng)
+    state = _make_state(rng, w13_layout)
     pristine = _snapshot(state)
     f1 = _make_factors(rng)
     f2 = _make_factors(rng)
@@ -358,23 +377,73 @@ def test_padding_regions_bit_identical_after_syncs():
 
     for i in range(NUM_LAYERS):
         got13, was13 = bits(state[_w13_key(i)]), bits(pristine[_w13_key(i)])
-        # Rows beyond H and columns beyond I in both w13 slots.
-        assert np.array_equal(got13[:, :, H:, :], was13[:, :, H:, :])
-        assert np.array_equal(got13[:, :, :, I:], was13[:, :, :, I:])
+        if w13_layout == "4d":
+            # Rows beyond H and columns beyond I in both w13 slots.
+            assert np.array_equal(got13[:, :, H:, :], was13[:, :, H:, :])
+            assert np.array_equal(got13[:, :, :, I:], was13[:, :, :, I:])
+            # Sanity: the live regions DID change.
+            assert not np.array_equal(got13[:, :, :H, :I],
+                                      was13[:, :, :H, :I])
+        else:
+            # 3-D concat layout: rows beyond H, and per-half columns
+            # beyond I, are padding.
+            assert np.array_equal(got13[:, H:, :], was13[:, H:, :])
+            assert np.array_equal(got13[:, :, I:I_PAD], was13[:, :, I:I_PAD])
+            assert np.array_equal(got13[:, :, I_PAD + I:],
+                                  was13[:, :, I_PAD + I:])
+            assert not np.array_equal(got13[:, :H, :I], was13[:, :H, :I])
+            assert not np.array_equal(got13[:, :H, I_PAD:I_PAD + I],
+                                      was13[:, :H, I_PAD:I_PAD + I])
         got2, was2 = bits(state[_w2_key(i)]), bits(pristine[_w2_key(i)])
         # Rows beyond I and columns beyond H in w2.
         assert np.array_equal(got2[:, I:, :], was2[:, I:, :])
         assert np.array_equal(got2[:, :, H:], was2[:, :, H:])
-        # Sanity: the live regions DID change.
-        assert not np.array_equal(got13[:, :, :H, :I], was13[:, :, :H, :I])
         assert not np.array_equal(got2[:, :I, :H], was2[:, :I, :H])
 
 
-def test_scale_change_between_syncs_uses_prev_scale():
+def test_factors_as_path_and_nested_lists_match_dict(tmp_path):
+    """The three RPC wire forms — safetensors path, dict of ndarrays, dict
+    of msgpack-style nested lists — must produce identical merged states."""
+    from safetensors.numpy import save_file
+
+    rng = np.random.default_rng(6)
+    state_arr = _make_state(rng)
+    factors = _make_factors(rng)
+
+    state_path = {k: jnp.array(v) for k, v in state_arr.items()}
+    state_list = {k: jnp.array(v) for k, v in state_arr.items()}
+
+    st_file = tmp_path / "moe_lora.safetensors"
+    save_file(factors, str(st_file))
+    lists = {k: v.tolist() for k, v in factors.items()}
+
+    assert _apply(state_arr, factors, SCALE) == {
+        "layers": NUM_LAYERS,
+        "incremental": False
+    }
+    assert _apply(state_path, str(st_file), SCALE) == {
+        "layers": NUM_LAYERS,
+        "incremental": False
+    }
+    assert _apply(state_list, lists, SCALE) == {
+        "layers": NUM_LAYERS,
+        "incremental": False
+    }
+
+    for key in state_arr:
+        a = np.asarray(state_arr[key]).view(np.uint16)
+        b = np.asarray(state_path[key]).view(np.uint16)
+        c = np.asarray(state_list[key]).view(np.uint16)
+        assert np.array_equal(a, b), f"path form differs at {key}"
+        assert np.array_equal(a, c), f"list form differs at {key}"
+
+
+@pytest.mark.parametrize("w13_layout", W13_LAYOUTS)
+def test_scale_change_between_syncs_uses_prev_scale(w13_layout):
     """Sync 2 with a different scale must subtract the old delta at the OLD
     scale (prev_scale path), landing on W0 + delta(F2, new_scale)."""
     rng = np.random.default_rng(5)
-    state = _make_state(rng)
+    state = _make_state(rng, w13_layout)
     pristine = _snapshot(state)
     f1 = _make_factors(rng)
     f2 = _make_factors(rng)
