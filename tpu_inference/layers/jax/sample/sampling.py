@@ -148,7 +148,9 @@ def sample(
 
 
 def compute_logprobs(logits: jax.Array) -> jax.Array:
-    return jax.nn.log_softmax(logits, axis=-1)
+    logprobs = jax.nn.log_softmax(logits, axis=-1)
+    # bf16 gpt-oss emits occasional NaN logprobs; clamp at source for RL stability.
+    return jnp.nan_to_num(logprobs, nan=-1.0e4, posinf=0.0, neginf=-1.0e4)
 
 
 @jax.jit(static_argnames=("max_logprobs", ))
