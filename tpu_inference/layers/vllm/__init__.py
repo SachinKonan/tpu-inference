@@ -17,10 +17,20 @@ from tpu_inference.layers.vllm import ops as ops
 from tpu_inference.layers.vllm import quantization as quantization
 
 
-# NOTE: this function is the entry_points target for the vllm general plugin.
+# NOTE: this function is the `vllm.general_plugins` entry_points target (see
+# setup.py). vLLM re-runs `load_general_plugins()` in every process it spawns,
+# which makes it the only reliable place to teach vLLM's OWN ModelRegistry
+# about architectures it does not ship -- that lookup happens in
+# `ModelConfig.__post_init__`, before any tpu-inference code would otherwise
+# run.
 def register_layers():
     # Override vLLM's built-in model classes with TPU-specific implementations
     # (e.g. DeepseekV4ForCausalLM). Done here because this is the plugin hook
     # that vLLM invokes at startup, before any model is loaded.
     from tpu_inference.models.vllm.experimental import register_models
     register_models()
+    # SkyRL: out-of-tree architectures (Muse-Glimmer). See
+    # models/common/oot_registration.py.
+    from tpu_inference.models.common.oot_registration import \
+        register_out_of_tree_architectures
+    register_out_of_tree_architectures()

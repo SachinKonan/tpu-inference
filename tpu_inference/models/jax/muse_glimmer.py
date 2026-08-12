@@ -37,6 +37,7 @@ the loader drops vision weights and :meth:`MuseGlimmerForConditionalGeneration`
 rejects multimodal inputs with a clear error.
 """
 
+import functools
 from typing import Any, Iterable, List, Optional, Tuple
 
 import jax
@@ -66,12 +67,53 @@ from tpu_inference.models.jax.muse_glimmer_core import (SLIDING,
                                                         qk_normalize,
                                                         rms_norm_no_scale,
                                                         rms_norm_scaled)
-from tpu_inference.models.jax.utils.weight_utils import (LoadableWithIterator,
-                                                         StandardWeightLoader)
+from tpu_inference.models.jax.utils.weight_utils import (
+    LoadableWithIterator, StandardWeightLoader,
+    load_nnx_param_from_reshaped_torch)
 
 logger = init_logger(__name__)
 
 init_fn = nnx.initializers.uniform()
+
+
+def _load_kv_proj_replicated(jax_param, torch_weight, *, num_kv_heads_ckpt: int,
+                             repeats: int, head_dim: int, param_name: str):
+    """``k_proj``/``v_proj`` loader for checkpoints with fewer KV heads than TP.
+
+    Muse-Glimmer has ``num_key_value_heads == 2``.  At TP=4 the module pads the
+    KV axis to 4 (``utils.get_padded_num_heads``) so every device owns one KV
+    head, but ``JaxAutoWeightsLoader`` derives its reshape from the *padded*
+    parameter shape and knows nothing about replication -- it would try to
+    reshape the checkpoint's ``[2*H, D]`` tensor into ``[4, H, D]`` and fail
+    with a bare reshape error at load time.
+
+    Replicate here instead, element-wise (``h0 h0 h1 h1``), before handing the
+    tensor to the standard loader.  Element-wise is what makes device ``i``'s
+    KV head match the query heads sharded onto it: q heads 0-15 map to kv head
+    0 and 16-31 to kv head 1, so devices 0,1 need kv0 and devices 2,3 need kv1.
+    This mirrors the ``jnp.repeat(..., axis=1)`` the file-based loader applies
+    via ``get_default_maps``' ``pad_keys``.
+    """
+    w = torch_weight
+    if w.ndim != 2:
+        raise ValueError(
+            f"{param_name}: expected a 2-D [K*H, D] checkpoint tensor, got "
+            f"{tuple(w.shape)}")
+    kh, d = w.shape
+    if kh != num_kv_heads_ckpt * head_dim:
+        raise ValueError(
+            f"{param_name}: expected {num_kv_heads_ckpt}*{head_dim} rows, got "
+            f"{kh}")
+    w = w.reshape(num_kv_heads_ckpt, head_dim, d)
+    # repeat_interleave, NOT tile: [h0, h0, h1, h1].
+    w = w.repeat_interleave(repeats, dim=0)
+    w = w.reshape(num_kv_heads_ckpt * repeats * head_dim, d)
+    return load_nnx_param_from_reshaped_torch(
+        jax_param,
+        w,
+        reshape_dims=(num_kv_heads_ckpt * repeats, head_dim, d),
+        permute_dims=(2, 0, 1),
+        param_name=param_name)
 
 
 def _text_config(hf_config: Any) -> Any:
@@ -249,6 +291,10 @@ class MuseGlimmerAttention(JaxModule):
                                                       sharding_size)
         padded_num_kv_heads = utils.get_padded_num_heads(
             self.num_kv_heads, sharding_size)
+        # Remember the CHECKPOINT's KV head count: the loader needs it to
+        # replicate into the padded axis (see _load_kv_proj_replicated).
+        self.num_kv_heads_ckpt = self.num_kv_heads
+        self.kv_replication = padded_num_kv_heads // self.num_kv_heads
         self.num_heads = padded_num_heads
         self.num_kv_heads = padded_num_kv_heads
         self.mesh = mesh
@@ -312,6 +358,23 @@ class MuseGlimmerAttention(JaxModule):
             quant_config=quant_config,
             prefix=prefix + ".attn_gate_proj",
         )
+
+        if self.kv_replication > 1:
+            if self.head_dim != self.head_dim_original:
+                raise NotImplementedError(
+                    "KV-head replication combined with head_dim padding is "
+                    f"not implemented (head_dim {self.head_dim_original} -> "
+                    f"{self.head_dim})")
+            for name, proj in (("k_proj", self.k_proj), ("v_proj",
+                                                         self.v_proj)):
+                proj.weight.set_metadata(
+                    "weight_loader",
+                    functools.partial(
+                        _load_kv_proj_replicated,
+                        num_kv_heads_ckpt=self.num_kv_heads_ckpt,
+                        repeats=self.kv_replication,
+                        head_dim=self.head_dim_original,
+                        param_name=f"{prefix}.{name}.weight"))
 
         self._q_scale = 1.0
         self._k_scale = 1.0
