@@ -17,6 +17,13 @@ from tpu_inference.layers.vllm import ops as ops
 from tpu_inference.layers.vllm import quantization as quantization
 
 
-# NOTE: this empty function exists for an entry_points target for vllm plugin.
+# NOTE: this function is the `vllm.general_plugins` entry_points target (see
+# setup.py). vLLM re-runs `load_general_plugins()` in every process it spawns,
+# which makes it the only reliable place to teach vLLM's OWN ModelRegistry
+# about JAX-only architectures -- that lookup happens in
+# `ModelConfig.__post_init__`, before any tpu-inference code would otherwise
+# run. See models/common/oot_registration.py.
 def register_layers():
-    pass
+    from tpu_inference.models.common.oot_registration import \
+        register_out_of_tree_architectures
+    register_out_of_tree_architectures()
