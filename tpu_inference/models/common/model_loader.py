@@ -47,6 +47,13 @@ logger = init_logger(__name__)
 
 _MODEL_REGISTRY = {}
 
+# Fallback lookup by `config.model_type`, used only when none of the config's
+# `architectures` entries is registered. Keep this tiny: it exists for models
+# whose published arch string does not uniquely identify the implementation
+# (Muse-Glimmer publishes the multimodal `...ForConditionalGeneration` name for
+# what is, on the JAX side, a text-only decoder).
+_MODEL_TYPE_REGISTRY = {}
+
 # List of architectures that are preferred to use "vllm" implementation over
 # "flax_nnx" implementation due to various factors such as performance.
 _VLLM_PREFERRED_ARCHITECTURES: frozenset[str] = frozenset({
@@ -79,6 +86,8 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     from tpu_inference.models.jax.llama4 import Llama4ForCausalLM
     from tpu_inference.models.jax.llama_eagle3 import EagleLlama3ForCausalLM
     from tpu_inference.models.jax.llama_guard_4 import LlamaGuard4ForCausalLM
+    from tpu_inference.models.jax.muse_glimmer import \
+        MuseGlimmerForConditionalGeneration
     from tpu_inference.models.jax.qwen2 import Qwen2ForCausalLM
     from tpu_inference.models.jax.qwen2_5_vl import \
         Qwen2_5_VLForConditionalGeneration
@@ -98,11 +107,27 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     _MODEL_REGISTRY[
         "Gemma4ForConditionalGeneration"] = Gemma4ForConditionalGeneration
     _MODEL_REGISTRY["Gemma4MTPModel"] = Gemma4MTPForCausalLM
+    # Muse-Glimmer: the checkpoint's arch string is the multimodal
+    # ...ForConditionalGeneration one, but this implementation is TEXT-ONLY
+    # (no vision tower / projector). Multimodal requests are rejected at
+    # `get_multimodal_embeddings`.
+    _MODEL_REGISTRY[
+        "MuseGlimmerForConditionalGeneration"] = MuseGlimmerForConditionalGeneration
+    _MODEL_TYPE_REGISTRY[
+        "muse_glimmer"] = MuseGlimmerForConditionalGeneration
+    _MODEL_TYPE_REGISTRY[
+        "muse_glimmer_text"] = MuseGlimmerForConditionalGeneration
 
-    architectures = getattr(config, "architectures", [])
+    architectures = getattr(config, "architectures", None) or []
     for arch in architectures:
         if arch in _MODEL_REGISTRY:
             return _MODEL_REGISTRY[arch]
+    model_type = getattr(config, "model_type", None)
+    if model_type in _MODEL_TYPE_REGISTRY:
+        logger.info(
+            "No registered architecture in %s; resolving by model_type=%r.",
+            architectures, model_type)
+        return _MODEL_TYPE_REGISTRY[model_type]
     raise UnsupportedArchitectureError(
         f"Model architectures {architectures} not "
         "registered in tpu-inference. Falling back to vLLM-native "
