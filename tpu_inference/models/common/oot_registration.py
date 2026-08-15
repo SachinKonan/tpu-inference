@@ -17,28 +17,44 @@ vLLM resolves ``config.architectures`` against **its own** ``ModelRegistry``
 inside ``ModelConfig.__post_init__`` (``is_text_generation_model`` ->
 ``inspect_model_cls`` -> ``_raise_for_unsupported``).  That happens in
 ``EngineArgs.create_engine_config()``, i.e. *before* any tpu-inference code
-runs, so a JAX-only architecture that is registered only in
+runs, so an architecture that is registered only in
 ``tpu_inference.models.common.model_loader._MODEL_REGISTRY`` never gets a
 chance: ``vllm serve`` dies with
 
     ValueError: Model architectures ['MuseGlimmerForConditionalGeneration']
     are not supported for now.
 
-Registering a *torch shim* under the same name clears that gate.  The shim is
-never instantiated and never executed: with ``MODEL_IMPL_TYPE=flax_nnx``,
-``get_model()`` resolves the real implementation out of tpu-inference's own
-registry.  The shim exists purely to satisfy
-``vllm.model_executor.models.interfaces_base.is_text_generation_model``, which
-wants ``__init__`` to accept ``vllm_config``, plus callable ``embed_input_ids``,
-``forward(input_ids, positions)`` and ``compute_logits``.
+Registering a torch class under the same name clears that gate.
+
+Which implementation actually serves is decided later and independently, by
+``model_loader.get_model``:
+
+* ``MODEL_IMPL_TYPE=flax_nnx`` (and ``auto``, which resolves to ``flax_nnx``
+  for every architecture outside ``_VLLM_PREFERRED_ARCHITECTURES``) takes the
+  ``get_flax_model`` branch and looks the class up in tpu-inference's own
+  ``_MODEL_REGISTRY``.  vLLM's registry is never consulted there, so what is
+  registered here has no effect on the JAX path.
+* ``MODEL_IMPL_TYPE=vllm`` takes ``get_vllm_model``, which calls vLLM's
+  ``get_model`` and therefore instantiates exactly the class registered here.
+
+For Muse-Glimmer the registered target is a real torch model
+(``models/vllm/muse_glimmer.py``).  It exists because the JAX path returns
+``lora_manager=None`` unconditionally, so ``--enable-lora`` is impossible under
+``flax_nnx``; the torch model is built from vLLM's own parallel-linear classes
+and therefore picks up the whole LoRA stack.  Architectures that have no torch
+implementation keep pointing at ``JaxOnlyTextGenerationShim`` below, which
+satisfies ``vllm.model_executor.models.interfaces_base.is_text_generation_model``
+(``__init__`` accepting ``vllm_config``, plus callable ``embed_input_ids``,
+``forward(input_ids, positions)`` and ``compute_logits``) and raises if
+anything ever executes it.
 
 Registration happens from the ``vllm.general_plugins`` entry point
 (``tpu_inference.layers.vllm:register_layers``).  vLLM re-runs
 ``load_general_plugins()`` in every process it spawns -- the API server, the
 EngineCore child, each worker, and the model-inspection subprocess -- so the
 registration survives the ``spawn`` boundary.  The target is given as a
-``"module:ClassName"`` string so that process 0 does not import JAX just to
-answer a registry question.
+``"module:ClassName"`` string so that process 0 does not import torch/JAX model
+code just to answer a registry question.
 """
 from torch import nn
 
@@ -49,10 +65,12 @@ logger = init_logger(__name__)
 # arch name -> "module:ClassName" resolved lazily by vLLM.
 OUT_OF_TREE_ARCHITECTURES: dict[str, str] = {
     # meta-models/Muse-Glimmer-30B. The checkpoint advertises the multimodal
-    # class name; the JAX implementation is text-only (see
-    # tpu_inference/models/jax/muse_glimmer.py).
+    # class name; both implementations here are text-only -- the JAX one in
+    # tpu_inference/models/jax/muse_glimmer.py (served under
+    # MODEL_IMPL_TYPE=flax_nnx, which does not read this table) and the torch
+    # one below (served under MODEL_IMPL_TYPE=vllm, which does).
     "MuseGlimmerForConditionalGeneration":
-    "tpu_inference.models.common.oot_registration:JaxOnlyTextGenerationShim",
+    "tpu_inference.models.vllm.muse_glimmer:MuseGlimmerForCausalLM",
 }
 
 _UNSUPPORTED = (
@@ -106,8 +124,9 @@ def register_out_of_tree_architectures() -> None:
             ModelRegistry.register_model(arch, target)
             logger.info(
                 "Registered out-of-tree architecture %s -> %s with vLLM's "
-                "ModelRegistry (JAX-only; served via MODEL_IMPL_TYPE=flax_nnx).",
-                arch, target)
+                "ModelRegistry. This target is instantiated only under "
+                "MODEL_IMPL_TYPE=vllm; flax_nnx/auto resolve the JAX model "
+                "from tpu-inference's own registry instead.", arch, target)
         except Exception:
             # vLLM swallows plugin exceptions and then fails later with an
             # unhelpful "architectures not supported", so log loudly here.
