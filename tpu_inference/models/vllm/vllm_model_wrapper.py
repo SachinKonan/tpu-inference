@@ -792,10 +792,26 @@ def replace_set_lora(model):
         with torchax.default_env(), torch.no_grad():
             self._original_reset_lora(index)
 
+    # Count what actually got wrapped. Zero wrapped modules is the failure mode
+    # that matters -- a target_modules name mismatch injects nothing, the
+    # adapter still "loads", and the served output is silently the base model's
+    # -- so the number is logged rather than left to be inferred.
+    wrapped: dict[str, int] = {}
     for _, module in model.named_modules():
         if isinstance(module, BaseLayerWithLoRA):
+            cls = type(module).__name__
+            wrapped[cls] = wrapped.get(cls, 0) + 1
             module._original_set_lora = module.set_lora
             module._original_reset_lora = module.reset_lora
             module.set_lora = _tpu_set_lora.__get__(module, module.__class__)
             module.reset_lora = _tpu_reset_lora.__get__(
                 module, module.__class__)
+    total = sum(wrapped.values())
+    logger.info(
+        "LORA-WRAPPED-MODULES total=%d by_class=%s", total,
+        ", ".join(f"{k}={v}" for k, v in sorted(wrapped.items())))
+    if total == 0:
+        logger.warning(
+            "LORA-WRAPPED-MODULES total=0: no layer of %s matched "
+            "lora_config.target_modules -- adapters will load but inject "
+            "nothing.", type(model).__name__)
