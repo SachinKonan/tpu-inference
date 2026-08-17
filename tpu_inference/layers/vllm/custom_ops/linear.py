@@ -79,7 +79,9 @@ class VllmQKVParallelLinear(QKVParallelLinear):
     After super init, `self.total_num_kv_heads` is restored to the *real*
     value so vLLM's `_load_fused_module_from_checkpoint` (Phi-3-style fused
     QKV on disk) computes correct on-disk offsets. Other shape attributes
-    (`num_kv_heads`, `output_sizes`, allocated buffers) stay inflated.
+    (`num_kv_heads`, `output_sizes`, allocated buffers) stay inflated —
+    they describe the WEIGHT BUFFER, not the forward output: `forward`
+    returns the STOCK width (see its docstring / `dedup_replicated_kv`).
     """
 
     def __init__(self,
@@ -152,10 +154,44 @@ class VllmQKVParallelLinear(QKVParallelLinear):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        """WIDTH CONTRACT: returns the STOCK global width.
+
+        The weight buffer (and `quant_method.apply`'s raw output) carry the
+        INFLATED width `q + 2 * num_kv_heads * head_dim` (kv heads inflated
+        to mesh TP), but this forward hands the model the STOCK width
+        `q + 2 * total_num_kv_heads * head_dim`: `dedup_replicated_kv`
+        collapses the replica sub-axis back out of the global view.  Model
+        code must therefore compute its split sizes and its `Attention`
+        head count from the REAL config values (as stock vLLM models do at
+        torch world_size=1), NOT from this layer's inflated `num_kv_heads`
+        / `output_sizes`.  Downstream agrees with the stock convention: the
+        runner pads the KV cache head count up to TP itself
+        (`get_padded_num_heads`) and `sharded_ragged_paged_attention`
+        replicates k/v at kernel entry.
+        """
         if self.num_kv_head_replicas == 1:
             return super().forward(x)
 
         out, bias = super().forward(x)
+        return self.dedup_replicated_kv(out), bias
+
+    def dedup_replicated_kv(self, out: torch.Tensor) -> torch.Tensor:
+        """Collapse the KV-head replication out of the GLOBAL output view.
+
+        Input: the raw qkv output at the INFLATED width (from the weight
+        buffer / `quant_method.apply`).  Output: the STOCK width
+        `q + 2 * total_num_kv_heads * head_dim` — k/v keep their per-device
+        placement (`_tile_kv` already put one full KV-head copy on every
+        device of a replica group), the `shard_map` below only re-labels the
+        replica sub-axis as replicated, which drops the duplicate copies
+        from the logical/global shape with no data movement.
+
+        Also used by `vllm_model_wrapper.load_lora_model` to restore this
+        contract on LoRA-wrapped layers, whose `apply` path calls
+        `quant_method.apply` directly and bypasses this layer's forward.
+        """
+        if self.num_kv_head_replicas == 1:
+            return out
         out_jax = jax_view(out)
 
         out_jax = reorder_concatenated_tensor_for_sharding(
@@ -223,4 +259,4 @@ class VllmQKVParallelLinear(QKVParallelLinear):
             v_jax = _mark_kv_head_replicated(v_jax)
 
         out_jax = jnp.concatenate([q_jax, k_jax, v_jax], axis=-1)
-        return torch_view(out_jax), bias
+        return torch_view(out_jax)

@@ -771,7 +771,52 @@ def load_lora_model(model: torch.nn.Module, vllm_config: VllmConfig,
         device,
         model.embedding_modules,
     )
-    return lora_manager, lora_manager.create_lora_manager(model)
+    wrapped_model = lora_manager.create_lora_manager(model)
+    _restore_stock_qkv_width_under_lora(wrapped_model)
+    return lora_manager, wrapped_model
+
+
+def _restore_stock_qkv_width_under_lora(model: torch.nn.Module) -> int:
+    """Keep the qkv WIDTH CONTRACT intact under LoRA wrapping.
+
+    `VllmQKVParallelLinear.forward` returns the STOCK global width — it
+    collapses the KV-head replication (kv heads inflated to mesh TP) back out
+    of the global view via `dedup_replicated_kv`.  vLLM's LoRA wrappers never
+    call that forward: `ColumnParallelLinearWithLoRA.forward` -> `apply` ->
+    `_mcp_apply` -> `base_layer.quant_method.apply` directly, so a wrapped
+    layer would return the INFLATED width instead — enabling LoRA silently
+    changes the model-facing qkv geometry, and a stock-geometry model's
+    split then reads k/v off the wrong rows.  Re-route every wrapped
+    replicated-KV qkv layer's output through the same collapse so LoRA
+    on/off is width-identical.
+
+    (Known residual, deliberately out of scope here: adapters that target
+    k_proj/v_proj on a replicated-KV model would additionally need their
+    k/v lora_b tiled per replica in `set_lora`; the no-adapter path and
+    q/MLP-only adapters are unaffected.)
+    """
+    from tpu_inference.layers.vllm.custom_ops.linear import \
+        VllmQKVParallelLinear
+
+    n = 0
+    for _, module in model.named_modules():
+        base = getattr(module, "base_layer", None)
+        if (isinstance(module, BaseLayerWithLoRA)
+                and isinstance(base, VllmQKVParallelLinear)
+                and getattr(base, "num_kv_head_replicas", 1) > 1):
+            orig_apply = module.apply
+
+            def _apply(x, bias=None, _orig=orig_apply, _base=base):
+                return _base.dedup_replicated_kv(_orig(x, bias))
+
+            module.apply = _apply
+            n += 1
+    if n:
+        logger.info(
+            "KV-replication width contract restored on %d LoRA-wrapped qkv "
+            "layers (vLLM's LoRA `apply` bypasses the base forward's "
+            "replica collapse).", n)
+    return n
 
 
 # The reason why replace the method is that the set_lora and reset_lora need to
