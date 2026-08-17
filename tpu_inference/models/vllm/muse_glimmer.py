@@ -260,18 +260,28 @@ class MuseGlimmerAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
-        # IMPORTANT: read the head counts back off the layer rather than
-        # recomputing them.  tpu-inference's OOT `VllmQKVParallelLinear`
-        # inflates `total_num_kv_heads` up to the mesh TP size when
-        # TP > num_key_value_heads -- which is exactly Muse-Glimmer's case
-        # (2 KV heads, TP=4) -- replicating each KV head with
-        # `repeat_interleave` ([h0, h0, h1, h1], NOT [h0, h1, h0, h1]; `tile`
-        # here is the bug that bit the JAX port, invisible on tiny weights and
-        # catastrophic on real ones).  The layer's own `num_heads` /
-        # `num_kv_heads` are the only counts that describe the tensor it
-        # actually returns.
+        # HEAD COUNTS: STOCK geometry, deliberately (2026-08-17 crash root
+        # cause).  tpu-inference's OOT `VllmQKVParallelLinear` inflates its
+        # WEIGHT BUFFER to `mesh TP` KV heads when TP > num_key_value_heads
+        # (Muse-Glimmer: 2 KV heads, TP=4), replicating each head with
+        # `repeat_interleave` ([h0 h0 h1 h1]) — but its `forward` then
+        # COLLAPSES the replica sub-axis back out of the global view
+        # (`dedup_replicated_kv`) and returns the STOCK widths
+        # `q + 2 * total_num_kv_heads * head_dim`, so that model code written
+        # against stock vLLM (torch world_size=1) keeps working — exactly
+        # what upstream vLLM's own muse_glimmer model assumes.  A previous
+        # revision read the layer's INFLATED `num_kv_heads` here instead;
+        # under torchax, `split` lowers to clamped JAX slicing, so splitting
+        # the collapsed (narrower) tensor by inflated sizes silently produced
+        # an EMPTY v — the first-request TPU crash at flash_attn reshape.
+        # `total_num_kv_heads` is the REAL checkpoint count (the OOT layer
+        # restores it after its inflated super-init; stock vLLM layers carry
+        # the same attribute), and the rest of the stack agrees with stock
+        # geometry: the runner pads the KV cache head count up to TP
+        # (`get_padded_num_heads`) and `sharded_ragged_paged_attention`
+        # replicates k/v at kernel entry.
         self.num_heads = self.qkv_proj.num_heads
-        self.num_kv_heads = self.qkv_proj.num_kv_heads
+        self.num_kv_heads = self.qkv_proj.total_num_kv_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
 
@@ -366,6 +376,22 @@ class MuseGlimmerAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # HARDENING: under torchax, `split` lowers to JAX slicing, which
+        # CLAMPS out-of-range slices silently -- a qkv narrower than
+        # q_size + 2*kv_size does not raise, it hands back a truncated k and
+        # an EMPTY v, which then dies far away in the attention backend as
+        # `cannot reshape (0, kv_heads, head_dim)` (the 2026-08-17 crash).
+        # Fail here, loudly, naming the actual width.
+        if (q.shape[-1], k.shape[-1], v.shape[-1]) != (self.q_size,
+                                                       self.kv_size,
+                                                       self.kv_size):
+            raise AssertionError(
+                f"qkv_proj returned width {qkv.shape[-1]} but the model "
+                f"declares q_size + 2*kv_size = {self.q_size} + "
+                f"2*{self.kv_size} = {self.q_size + 2 * self.kv_size} "
+                f"(split produced q={q.shape[-1]} k={k.shape[-1]} "
+                f"v={v.shape[-1]}); the layer's runtime output width "
+                f"diverged from the model's declared head geometry")
 
         # Per-head, parameter-free norm over head_dim; `qk_scale_factor` on q
         # only, applied AFTER the norm (SPEC trap 2).
