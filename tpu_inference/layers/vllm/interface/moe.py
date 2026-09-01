@@ -19,6 +19,7 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 
 from tpu_inference import envs
 from tpu_inference.layers.common.moe import MoEBackend, moe_apply
+from tpu_inference.layers.common.moe_lora import FusedMoELoRAWeights
 from tpu_inference.layers.common.process_weights.moe_weights import \
     FusedMoEWeights
 from tpu_inference.layers.common.sharding import ShardingAxisName
@@ -60,12 +61,14 @@ def select_moe_backend_from_fused_moe_config(
     return MoEBackend.GMM_TP
 
 
-def vllm_moe_apply(layer: RoutedExperts,
-                   weights: FusedMoEWeights,
-                   quant_method_instance: FusedMoEMethodBase,
-                   x: torch.Tensor,
-                   router_logits: torch.Tensor,
-                   input_ids: torch.Tensor | None = None) -> torch.Tensor:
+def vllm_moe_apply(
+        layer: RoutedExperts,
+        weights: FusedMoEWeights,
+        quant_method_instance: FusedMoEMethodBase,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        lora_weights: FusedMoELoRAWeights | None = None) -> torch.Tensor:
     """
     Shared function for applying a FusedMoE layer for the TorchAX/vLLM backend.
 
@@ -131,4 +134,5 @@ def vllm_moe_apply(layer: RoutedExperts,
             moe_backend=quant_method_instance.moe_backend,
             mesh=quant_method_instance.mesh,
             extra_backend_kwargs=extra_kwargs,
+            lora_weights=lora_weights,
         ))

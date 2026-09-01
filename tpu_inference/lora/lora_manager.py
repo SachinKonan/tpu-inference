@@ -37,6 +37,7 @@ MAXTEXT_TO_HF_LORA_MAPPING = {
     "wi_0": "gate_proj",
     "wi_1": "up_proj",
     "wo": "down_proj",
+    "gate": "router",
     "embed": "embed_tokens",
     "lm_head": "lm_head",
 }
@@ -46,7 +47,7 @@ LORA_SPLIT_PATTERN = re.compile(r'[,|]')
 
 
 class TPULRUCacheLoRAModelManager(LRUCacheLoRAModelManager):
-    """LRU-cache LoRA model manager that skips fused-MoE layers on TPU.
+    """LRU-cache LoRA model manager that skips fused-MoE wrappers on TPU.
 
     vLLM's FusedMoEWithLoRA requires the modular-kernel flow: it calls
     quant_method.select_gemm_impl() (which TPU monolithic quant methods such
@@ -55,9 +56,10 @@ class TPULRUCacheLoRAModelManager(LRUCacheLoRAModelManager):
     method for FusedMoEModularMethod, which has no apply_monolithic() and
     would break the TPU JAX execution path even if construction succeeded.
 
-    Expert LoRA on TPU is instead applied by merging deltas directly into
-    the base fused-expert weights via the apply_moe_lora_deltas worker RPC,
-    so the PEFT-style wrapper is skipped here.
+    MXFP4 expert LoRA on TPU is instead held in separate fixed-shape BF16
+    buffers and evaluated by the GMM backend.  ``set_moe_lora_factors``
+    replaces those buffers without modifying the base.  The GPT-OSS router
+    remains an ordinary ReplicatedLinear and uses vLLM's standard LoRA path.
     """
 
     def _match_target_modules(self, module_name: str) -> bool:
@@ -70,8 +72,8 @@ class TPULRUCacheLoRAModelManager(LRUCacheLoRAModelManager):
         if isinstance(module, FusedMoE):
             logger.warning_once(
                 "Skipping LoRA wrapping for fused-MoE module(s) (e.g. %s): "
-                "FusedMoE LoRA adapters are not supported on TPU. Expert "
-                "LoRA is applied via merge-on-load (apply_moe_lora_deltas).",
+                "the TPU GMM backend consumes separate expert-LoRA factor "
+                "buffers instead of vLLM's modular GPU MoE wrapper.",
                 module_name)
             return False
         return True

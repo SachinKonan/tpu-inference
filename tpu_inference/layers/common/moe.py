@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from enum import Enum
 from typing import TYPE_CHECKING, Tuple, Union
 
@@ -27,11 +29,13 @@ from tpu_inference.logger import init_logger
 from tpu_inference.utils import to_jax_dtype
 
 if TYPE_CHECKING:
+    from tpu_inference.layers.common.moe_lora import FusedMoELoRAWeights
     from tpu_inference.layers.common.process_weights.moe_weights import (
         FusedMoEWeights, UnfusedMoEWeights)
     from tpu_inference.layers.jax.moe.moe import JaxMoE
 else:
     FusedMoEWeights = None
+    FusedMoELoRAWeights = None
     UnfusedMoEWeights = None
     JaxMoE = None
 
@@ -78,6 +82,7 @@ def moe_apply(
     moe_backend: MoEBackend,
     mesh: Mesh,
     extra_backend_kwargs: dict,
+    lora_weights: FusedMoELoRAWeights | None = None,
 ) -> jax.Array:
     extra_backend_kwargs = dict(
         extra_backend_kwargs) if extra_backend_kwargs else {}
@@ -92,6 +97,10 @@ def moe_apply(
                 activation = "silu_and_mul_with_clamp"
         match moe_backend:
             case MoEBackend.FUSED_MOE:
+                if lora_weights is not None:
+                    raise NotImplementedError(
+                        "Fused GPT-OSS expert LoRA is currently supported "
+                        "only by the GMM_TP and GMM_EP backends.")
                 subc_quant_w1_sz = None
                 subc_quant_w2_sz = None
                 if weights.w13_weight_scale is not None and weights.w2_weight_scale is not None:
@@ -145,6 +154,7 @@ def moe_apply(
                     w2_scale=weights.w2_weight_scale,
                     w1_bias=weights.w13_bias,
                     w2_bias=weights.w2_bias,
+                    lora_weights=lora_weights,
                     gating_output=gating_output,
                     topk=layer.top_k,
                     renormalize=layer.renormalize,

@@ -17,9 +17,10 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 import torch
-from jax.sharding import Mesh, PartitionSpec
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from torch.nn.parameter import Parameter
 from torchax.interop import jax_view, torch_view
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
                                                   RoutedExperts)
@@ -39,6 +40,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import \
     is_layer_skipped
 
 from tpu_inference.layers.common.moe import MoEBackend
+from tpu_inference.layers.common.moe_lora import FusedMoELoRAWeights
 from tpu_inference.layers.common.process_weights.moe_weights import (
     FusedMoEWeights, process_moe_weights, quantize_moe_weights,
     shard_moe_weights)
@@ -46,6 +48,7 @@ from tpu_inference.layers.common.quant_methods import MXFP4
 from tpu_inference.layers.common.quantization import \
     dequantize_tensor_from_mxfp4_packed
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.common.utils import general_device_put
 from tpu_inference.layers.vllm.interface.moe import (
     select_moe_backend_from_fused_moe_config, vllm_moe_apply)
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
@@ -59,6 +62,16 @@ REQUANTIZED_BLOCK_SIZE = 512
 P = PartitionSpec
 
 logger = init_logger(__name__)
+
+_TPU_MOE_LORA_BUFFER_NAMES = {
+    "gate_a": "tpu_moe_lora_gate_a",
+    "gate_b": "tpu_moe_lora_gate_b",
+    "up_a": "tpu_moe_lora_up_a",
+    "up_b": "tpu_moe_lora_up_b",
+    "down_a": "tpu_moe_lora_down_a",
+    "down_b": "tpu_moe_lora_down_b",
+    "scale": "tpu_moe_lora_scale",
+}
 
 
 @register_quantization_config(MXFP4)
@@ -108,12 +121,80 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 
         self.mesh = mesh
         self.moe_backend = select_moe_backend_from_fused_moe_config(self.moe)
+        current_config = get_current_vllm_config_or_none()
+        self.lora_config = (None if current_config is None else
+                            current_config.lora_config)
 
         self.extra_backend_kwargs = {}
         if self.moe_backend == MoEBackend.FUSED_MOE:
             # When fused moe kernle is used, we pass extra arguments like
             # tuned block sizes to the kernel.
             self.extra_backend_kwargs = dict(ep_axis_name=ep_axis_name, )
+
+    def _create_lora_buffers(self, layer: RoutedExperts,
+                             weights: FusedMoEWeights) -> None:
+        """Create fixed-shape BF16 factor buffers before JAX compilation.
+
+        Expert adapters are single-active-adapter on TPU for now.  Buffer
+        shapes use ``max_lora_rank`` so swapping checkpoints changes values,
+        never the model pytree or executable signature.
+        """
+
+        if self.lora_config is None:
+            return
+        if hasattr(layer, _TPU_MOE_LORA_BUFFER_NAMES["gate_a"]):
+            return
+        if self.moe_backend not in (MoEBackend.GMM_EP, MoEBackend.GMM_TP):
+            raise NotImplementedError(
+                "MXFP4 expert LoRA requires the GMM_TP or GMM_EP backend; "
+                f"got {self.moe_backend.value}.")
+        if layer.activation != MoEActivation.SWIGLUOAI:
+            raise NotImplementedError(
+                "The TPU MXFP4 expert-LoRA path currently implements the "
+                "GPT-OSS SwiGLU activation contract only.")
+
+        num_experts, padded_hidden, fused_intermediate = (
+            weights.w13_weight.shape)
+        padded_intermediate = weights.w2_weight.shape[1]
+        if fused_intermediate != 2 * padded_intermediate:
+            raise ValueError(
+                "Expected fused GPT-OSS W13 output to be twice W2's "
+                "intermediate input, got "
+                f"{fused_intermediate} and {padded_intermediate}.")
+        max_rank = int(self.lora_config.max_lora_rank)
+
+        if self.moe_backend == MoEBackend.GMM_EP:
+            expert_spec = P(ShardingAxisName.EXPERT)
+            gate_b_spec = expert_spec
+            down_a_spec = expert_spec
+        else:
+            gate_b_spec = P(None, None, ShardingAxisName.MLP_TENSOR)
+            down_a_spec = P(None, ShardingAxisName.MLP_TENSOR, None)
+
+        shapes_and_specs = {
+            "gate_a": ((padded_hidden, max_rank), P()),
+            "gate_b":
+            ((num_experts, max_rank, padded_intermediate), gate_b_spec),
+            "up_a": ((padded_hidden, max_rank), P()),
+            "up_b":
+            ((num_experts, max_rank, padded_intermediate), gate_b_spec),
+            "down_a":
+            ((num_experts, padded_intermediate, max_rank), down_a_spec),
+            "down_b": ((max_rank, padded_hidden), P()),
+            "scale": ((), P()),
+        }
+        for field, (shape, spec) in shapes_and_specs.items():
+            value = general_device_put(
+                jnp.zeros(shape, dtype=jnp.bfloat16),
+                NamedSharding(self.mesh, spec),
+            )
+            layer.register_buffer(_TPU_MOE_LORA_BUFFER_NAMES[field],
+                                  torch_view(value),
+                                  persistent=False)
+        logger.info_once(
+            "Allocated separate BF16 MXFP4 expert-LoRA buffers "
+            "(max_rank=%d, backend=%s); base expert weights remain immutable.",
+            max_rank, self.moe_backend.value)
 
     def get_fused_moe_quant_config(
             self, layer: torch.nn.Module) -> FusedMoEQuantConfig | None:
@@ -201,6 +282,8 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             layer.w13_bias = Parameter(weights.w13_bias, requires_grad=False)
             layer.w2_bias = Parameter(weights.w2_bias, requires_grad=False)
 
+        self._create_lora_buffers(layer, weights)
+
     def apply_monolithic(
         self,
         layer: RoutedExperts,
@@ -219,9 +302,18 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             w2_bias=jax_view(layer.w2_bias) if has_bias else None,
         )
 
+        lora_weights = None
+        if hasattr(layer, _TPU_MOE_LORA_BUFFER_NAMES["gate_a"]):
+            lora_weights = FusedMoELoRAWeights(
+                **{
+                    field: jax_view(getattr(layer, name))
+                    for field, name in _TPU_MOE_LORA_BUFFER_NAMES.items()
+                })
+
         return vllm_moe_apply(layer=layer,
                               weights=weights,
                               quant_method_instance=self,
                               x=x,
                               router_logits=router_logits,
-                              input_ids=input_ids)
+                              input_ids=input_ids,
+                              lora_weights=lora_weights)

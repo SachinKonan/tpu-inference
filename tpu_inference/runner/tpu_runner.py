@@ -15,6 +15,7 @@
 import functools
 import logging
 import random
+import re
 import sys
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -128,13 +129,15 @@ INVALID_TOKEN_ID = -1
 # Smallest output size
 MIN_NUM_SEQS = 8
 
-# Slot indices into the fused-MoE w13 tensor's second axis, whose
-# post-processed layout is (num_experts, 2, hidden_pad, intermediate_pad).
-# Slot 0 holds the gate projection (w1 / wi_0) and slot 1 the up projection
-# (w3 / wi_1) per the FUSED_MOE post-processing order.
-# TODO-verify: empirical verification may swap these two indices.
-W13_GATE_SLOT = 0
-W13_UP_SLOT = 1
+_MOE_LORA_BUFFER_SUFFIXES = {
+    "gate_a": "tpu_moe_lora_gate_a",
+    "gate_b": "tpu_moe_lora_gate_b",
+    "up_a": "tpu_moe_lora_up_a",
+    "up_b": "tpu_moe_lora_up_b",
+    "down_a": "tpu_moe_lora_down_a",
+    "down_b": "tpu_moe_lora_down_b",
+    "scale": "tpu_moe_lora_scale",
+}
 
 
 def _group_moe_lora_factors(factors):
@@ -178,236 +181,172 @@ def _resolve_moe_lora_factors(factors):
     return {k: np.asarray(v, dtype=np.float32) for k, v in factors.items()}
 
 
-def _compute_moe_lora_delta(component, lora_a, lora_b, scale):
-    """Compute the dense f32 LoRA delta for one MoE component ON THE HOST.
+def _moe_lora_buffer_layers(state) -> set[int]:
+    """Return layers that expose the separate MXFP4 LoRA factor buffers."""
 
-    numpy (not jnp) on purpose: a 20B gpt-oss push carries ~100 components
-    whose f32 deltas are ~1 GiB each. Computing them on-device exhausted HBM
-    (the serving process preallocates nearly all of it); host BLAS matmuls
-    keep the device footprint at a single component's cast increment.
-
-    Shapes (H=hidden, I=intermediate, E=num experts, r=rank):
-      wi_0/wi_1: A (H, r), B (r, E, I) -> delta (E, H, I)
-      wo:        A (E, I, r), B (r, H) -> delta (E, I, H)
-      router:    A (H, r), B (r, E)    -> delta (E, H)
-    """
-    a = np.asarray(lora_a, dtype=np.float32)
-    b = np.asarray(lora_b, dtype=np.float32)
-    if component in ("wi_0", "wi_1"):
-        r, e, f = b.shape
-        d = a.shape[0]
-        out = (scale * a) @ b.reshape(r, e * f)  # (d, e*f) single BLAS call
-        return np.swapaxes(out.reshape(d, e, f), 0, 1)  # (e, d, f) view
-    if component == "wo":
-        e, f, r = a.shape
-        out = (scale * a.reshape(e * f, r)) @ b  # (e*f, d) single BLAS call
-        return out.reshape(e, f, b.shape[1])
-    if component == "router":
-        return ((scale * a) @ b).T
-    logger.warning("MoE LoRA merge: unknown component %r; skipping.",
-                   component)
-    return None
+    suffix = _MOE_LORA_BUFFER_SUFFIXES["gate_a"]
+    layers = set()
+    for key in state:
+        if not key.endswith(suffix):
+            continue
+        match = re.search(r"(?:^|\.)layers\.(\d+)\.", key)
+        if match is not None:
+            layers.add(int(match.group(1)))
+    return layers
 
 
-@functools.partial(jax.jit,
-                   static_argnames=("starts", ),
-                   donate_argnums=(0, ))
-def _moe_slice_add_donated(arr, inc, starts):
-    """``arr[starts : starts + inc.shape] += inc`` with ``arr`` donated.
-
-    Donation makes XLA reuse ``arr``'s buffer for the output, so merging
-    into every fused expert tensor of a large MoE keeps HBM at steady state
-    instead of briefly holding old+new copies of ~40 GB of expert weights
-    (which cannot fit next to the serving preallocation). The pre-donation
-    jax.Array handles become invalid, but the only live consumers of these
-    weights are the runner's ``state``/``state_leaves`` dict entries, which
-    the caller replaces immediately; the torch module's parameters are never
-    read after load (forward passes take weights via functional_call from
-    ``state_leaves``).
-    """
-    idx = tuple(slice(s, s + n) for s, n in zip(starts, inc.shape))
-    return arr.at[idx].add(inc.astype(arr.dtype))
-
-
-def _moe_lora_component_placement(component, inc, arr):
-    """Locate ``component``'s unpadded block inside state array ``arr``.
-
-    Returns ``(inc_to_send, starts)`` or ``(None, None)`` if the delta does
-    not fit. Supported fused w13 layouts:
-      - 3-D ``(E, H_pad, 2*I_pad)``: gate/up halves concatenated
-        (uninterleaved, w1/gate first) along the last axis — the actual
-        vllm/torchax post-processed layout (each half padded to I_pad, then
-        concatenated, then swapaxes(1, 2); see
-        layers/common/process_weights/moe_weights.py).
-      - 4-D ``(E, 2, H_pad, I_pad)``: gate/up stacked on axis 1
-        (W13_GATE_SLOT / W13_UP_SLOT).
-    """
-    if component in ("wi_0", "wi_1"):
-        slot = W13_GATE_SLOT if component == "wi_0" else W13_UP_SLOT
-        num_experts, hidden, intermediate = inc.shape
-        if arr.ndim == 4:
-            if (arr.shape[0] == num_experts and arr.shape[1] > slot
-                    and arr.shape[2] >= hidden
-                    and arr.shape[3] >= intermediate):
-                return inc[:, None], (0, slot, 0, 0)
-        elif arr.ndim == 3 and arr.shape[-1] % 2 == 0:
-            i_pad = arr.shape[-1] // 2
-            if (arr.shape[0] == num_experts and arr.shape[1] >= hidden
-                    and i_pad >= intermediate):
-                return inc, (0, 0, slot * i_pad)
-        return None, None
-    if component == "wo":
-        num_experts, intermediate, hidden = inc.shape
-        # Padded layout (E, I_pad, H_pad).
-        if (arr.ndim == 3 and arr.shape[0] == num_experts
-                and arr.shape[1] >= intermediate and arr.shape[2] >= hidden):
-            return inc, (0, 0, 0)
-        return None, None
-    if component == "router":
-        num_experts, hidden = inc.shape
-        # Router weight is (E, H): delta = (A @ B).T.
-        if (arr.ndim == 2 and arr.shape[0] >= num_experts
-                and arr.shape[1] >= hidden):
-            return inc, (0, 0)
-        return None, None
-    return None, None
-
-
-def _find_moe_state_key(state, layer_idx, token, require_weight_suffix=False):
-    """Find the unique state-dict key for ``layer_idx`` containing ``token``.
-
-    Returns None (after logging near-miss keys) unless exactly one key
-    matches, so a missing/ambiguous component is skipped rather than
-    corrupting an unrelated weight.
-    """
+def _find_moe_lora_buffer_key(state, layer_idx: int, field: str) -> str:
+    suffix = _MOE_LORA_BUFFER_SUFFIXES[field]
     layer_tag = f"layers.{layer_idx}."
-    matches = [k for k in state if layer_tag in k and token in k]
-    if require_weight_suffix:
-        matches = [k for k in matches if k.endswith(".weight")]
-    if len(matches) == 1:
-        return matches[0]
-    near_miss = sorted(k for k in state if layer_tag in k)[:20]
-    logger.warning(
-        "MoE LoRA merge: expected exactly one state key for layer %d "
-        "matching %r but found %s; near-miss keys for this layer: %s",
-        layer_idx, token, matches, near_miss)
-    return None
+    matches = [
+        key for key in state if layer_tag in key and key.endswith(suffix)
+    ]
+    if len(matches) != 1:
+        raise KeyError(f"Expected one {field!r} MXFP4 LoRA buffer for layer "
+                       f"{layer_idx}, found {matches}.")
+    return matches[0]
 
 
-def apply_moe_lora_deltas_to_state(state,
-                                   factors,
-                                   meta,
-                                   prev_factors=None,
-                                   prev_scale=None):
-    """Merge MoE LoRA deltas into the fused expert/router weights of ``state``.
+def _replace_moe_lora_buffer(
+    state,
+    key: str,
+    source: np.ndarray | float | None,
+    starts: tuple[int, ...] = ()) -> None:
+    """Replace one factor buffer, zero-padding to its compile-time shape."""
 
-    Pure merge-apply core of ``TPUModelRunner._apply_moe_lora_deltas`` (which
-    delegates here). ``state`` is a flat dict mapping parameter names to
-    arrays (jax arrays, or torchax torch-views of jax arrays) and is mutated
-    in place. ``factors`` is a flat dict of numpy f32 arrays keyed like
-    ``layers.{i}.{wi_0|wi_1|wo|router}.{lora_a|lora_b}`` (see
-    ``_compute_moe_lora_delta`` for shapes); ``meta`` carries ``scale``.
-
-    Incremental semantics: ``new_state = state + delta(new) - delta(prev)``
-    where ``prev_factors``/``prev_scale`` describe the previously merged
-    factors (``None`` on the first call, i.e. plain add). This keeps the
-    merged weights equal to ``base + delta(latest factors)`` without a
-    pristine copy of the base.
-
-    Memory discipline (the whole point of this shape of the code): deltas
-    are computed on the HOST in f32, cast to the weight dtype on the host,
-    and applied ONE COMPONENT AT A TIME via a donated-buffer sliced add —
-    peak extra HBM is a single component's increment, regardless of layer
-    count. ``factors``/``prev_factors`` may each be a safetensors path, a
-    dict of ndarrays, or a dict of nested lists (see
-    ``_resolve_moe_lora_factors``).
-
-    Returns ``{"layers": <touched layer count>, "incremental": <bool>}``.
-    """
-    # State values on the vllm/torchax path are jax views of torch params
-    # (see vllm_model_wrapper.load_weights / lora_utils.set_active_loras);
-    # unwrap defensively in case a torchax tensor view leaks through.
     from torchax.interop import jax_view, torch_view
 
-    scale = float(meta["scale"])
-    prev_scale = scale if prev_scale is None else float(prev_scale)
-    incremental = prev_factors is not None
-
-    new_groups = _group_moe_lora_factors(_resolve_moe_lora_factors(factors))
-    prev_groups = _group_moe_lora_factors(
-        _resolve_moe_lora_factors(prev_factors))
-
-    def _delta_or_none(groups, layer_comp, delta_scale):
-        ab = groups.get(layer_comp)
-        if not ab:
-            return None
-        if "lora_a" not in ab or "lora_b" not in ab:
-            logger.warning(
-                "MoE LoRA merge: layer %d component %r is missing "
-                "lora_a or lora_b; skipping it.", layer_comp[0], layer_comp[1])
-            return None
-        return _compute_moe_lora_delta(layer_comp[1], ab["lora_a"],
-                                       ab["lora_b"], delta_scale)
-
-    touched_layers = set()
-
-    # Union so components dropped from the new factors get un-merged.
-    for layer_comp in sorted(set(new_groups) | set(prev_groups)):
-        layer_idx, component = layer_comp
-        delta_new = _delta_or_none(new_groups, layer_comp, scale)
-        delta_old = _delta_or_none(prev_groups, layer_comp, prev_scale)
-        if delta_new is None and delta_old is None:
-            continue
-        if delta_new is None:
-            inc = -delta_old
-        elif delta_old is None:
-            inc = delta_new
-        else:
-            if delta_new.shape != delta_old.shape:
-                logger.warning(
-                    "MoE LoRA merge: layer %d component %r delta shape "
-                    "changed %s -> %s across calls; cannot merge "
-                    "incrementally, skipping it.", layer_idx, component,
-                    delta_old.shape, delta_new.shape)
-                continue
-            # Increment computed in f32 BEFORE the single cast on add.
-            inc = delta_new - delta_old
-
-        if component in ("wi_0", "wi_1"):
-            key = _find_moe_state_key(state, layer_idx, "w13_weight")
-        elif component == "wo":
-            key = _find_moe_state_key(state, layer_idx, "w2_weight")
-        elif component == "router":
-            key = _find_moe_state_key(state,
-                                      layer_idx,
-                                      "router",
-                                      require_weight_suffix=True)
-        else:
-            continue
-        if key is None:
-            continue
-
-        raw = state[key]
-        is_torch_view = isinstance(raw, torch.Tensor)
-        arr = jax_view(raw) if is_torch_view else raw
-
-        inc_send, starts = _moe_lora_component_placement(component, inc, arr)
-        if inc_send is None:
-            logger.warning(
-                "MoE LoRA merge: layer %d component %r delta shape %s "
-                "does not fit state array %r of shape %s; skipping it.",
-                layer_idx, component, inc.shape, key, arr.shape)
-            continue
-
-        # bf16 (weight-dtype) cast of the f32-computed increment on the
-        # host: one rounding, one small device transfer. The donated add
-        # reuses arr's buffer and preserves its (expert-sharded) layout.
-        inc_send = np.ascontiguousarray(inc_send).astype(arr.dtype)
-        updated = _moe_slice_add_donated(arr, inc_send, starts)
+    raw = state[key]
+    is_torch_view = isinstance(raw, torch.Tensor)
+    arr = jax_view(raw) if is_torch_view else raw
+    if source is None:
+        updated = jnp.zeros(arr.shape, dtype=arr.dtype)
+        sharding = getattr(arr, "sharding", None)
+        if sharding is not None:
+            updated = jax.device_put(updated, sharding)
         state[key] = torch_view(updated) if is_torch_view else updated
-        touched_layers.add(layer_idx)
+        return
+    source_arr = jnp.asarray(source, dtype=arr.dtype)
+    if source_arr.ndim != arr.ndim or len(starts) != arr.ndim:
+        raise ValueError(
+            f"Factor for {key!r} has shape {source_arr.shape}; target is "
+            f"{arr.shape}.")
+    if any(start < 0 or start + size > target for start, size, target in zip(
+            starts, source_arr.shape, arr.shape)):
+        raise ValueError(
+            f"Factor for {key!r} with shape {source_arr.shape} does not fit "
+            f"target {arr.shape} at {starts}.")
+    slices = tuple(
+        slice(start, start + size)
+        for start, size in zip(starts, source_arr.shape))
+    updated = jnp.zeros(arr.shape, dtype=arr.dtype).at[slices].set(source_arr)
+    sharding = getattr(arr, "sharding", None)
+    if sharding is not None:
+        updated = jax.device_put(updated, sharding)
+    state[key] = torch_view(updated) if is_torch_view else updated
 
-    return {"layers": len(touched_layers), "incremental": incremental}
+
+def set_moe_lora_factors_in_state(state, factors, meta):
+    """Install separate BF16 GPT-OSS expert factors without touching MXFP4.
+
+    The state pytree contains fixed-size, correctly sharded buffers allocated
+    while the MXFP4 model is loaded.  This function replaces their values for
+    the one globally active expert adapter.  Missing expert components are
+    zeroed, and ``factors=None`` clears the adapter.  Router LoRA is purposely
+    absent here: the GPT-OSS router is BF16 and is handled by vLLM's ordinary
+    ``ReplicatedLinearWithLoRA`` path.
+    """
+
+    if isinstance(state, nnx.State) or not isinstance(state, dict):
+        raise RuntimeError(
+            "set_moe_lora_factors_in_state requires the vLLM dict-state "
+            f"model path; got {type(state)}.")
+    resolved = _resolve_moe_lora_factors(factors)
+    groups = _group_moe_lora_factors(resolved)
+    buffer_layers = _moe_lora_buffer_layers(state)
+    if not buffer_layers:
+        raise RuntimeError(
+            "No separate MXFP4 expert-LoRA buffers were found. Start the "
+            "server with --enable-lora and the GMM_TP or GMM_EP backend.")
+
+    expert_layers = {
+        layer
+        for layer, component in groups if component in ("wi_0", "wi_1", "wo")
+    }
+    unknown_layers = expert_layers - buffer_layers
+    if unknown_layers:
+        raise ValueError(
+            "Expert LoRA factors target layers not present in the loaded "
+            f"model: {sorted(unknown_layers)}.")
+    meta = meta or {}
+    scale = float(meta.get("scale", 0.0 if resolved is None else 1.0))
+
+    def pair(layer_idx: int, component: str):
+        values = groups.get((layer_idx, component))
+        if values is None:
+            return None
+        if set(values) != {"lora_a", "lora_b"}:
+            raise ValueError(
+                f"Layer {layer_idx} component {component!r} must contain "
+                "exactly lora_a and lora_b.")
+        return (np.asarray(values["lora_a"], dtype=np.float32),
+                np.asarray(values["lora_b"], dtype=np.float32))
+
+    for layer_idx in sorted(buffer_layers):
+        gate = pair(layer_idx, "wi_0")
+        up = pair(layer_idx, "wi_1")
+        down = pair(layer_idx, "wo")
+
+        placements: dict[str, np.ndarray] = {}
+        if gate is not None:
+            gate_a, gate_b = gate
+            if gate_a.ndim != 2 or gate_b.ndim != 3:
+                raise ValueError(
+                    f"Layer {layer_idx} wi_0 expects A(H,R), B(R,E,I); "
+                    f"got {gate_a.shape}, {gate_b.shape}.")
+            if gate_a.shape[1] != gate_b.shape[0]:
+                raise ValueError(f"Layer {layer_idx} wi_0 rank mismatch: "
+                                 f"{gate_a.shape} vs {gate_b.shape}.")
+            placements["gate_a"] = gate_a
+            placements["gate_b"] = np.transpose(gate_b, (1, 0, 2))
+        if up is not None:
+            up_a, up_b = up
+            if up_a.ndim != 2 or up_b.ndim != 3:
+                raise ValueError(
+                    f"Layer {layer_idx} wi_1 expects A(H,R), B(R,E,I); "
+                    f"got {up_a.shape}, {up_b.shape}.")
+            if up_a.shape[1] != up_b.shape[0]:
+                raise ValueError(f"Layer {layer_idx} wi_1 rank mismatch: "
+                                 f"{up_a.shape} vs {up_b.shape}.")
+            placements["up_a"] = up_a
+            placements["up_b"] = np.transpose(up_b, (1, 0, 2))
+        if down is not None:
+            down_a, down_b = down
+            if down_a.ndim != 3 or down_b.ndim != 2:
+                raise ValueError(
+                    f"Layer {layer_idx} wo expects A(E,I,R), B(R,H); "
+                    f"got {down_a.shape}, {down_b.shape}.")
+            if down_a.shape[2] != down_b.shape[0]:
+                raise ValueError(f"Layer {layer_idx} wo rank mismatch: "
+                                 f"{down_a.shape} vs {down_b.shape}.")
+            placements["down_a"] = down_a
+            placements["down_b"] = down_b
+
+        for field in ("gate_a", "gate_b", "up_a", "up_b", "down_a", "down_b"):
+            key = _find_moe_lora_buffer_key(state, layer_idx, field)
+            source = placements.get(field)
+            starts = () if source is None else (0, ) * source.ndim
+            _replace_moe_lora_buffer(state, key, source, starts)
+
+        scale_key = _find_moe_lora_buffer_key(state, layer_idx, "scale")
+        _replace_moe_lora_buffer(state, scale_key,
+                                 np.asarray(scale, np.float32), ())
+
+    return {
+        "layers": len(buffer_layers),
+        "cleared": resolved is None,
+        "base_weights_mutated": False,
+    }
 
 
 @functools.partial(jax.jit, static_argnames=["dp_size", "tokens_per_dp"])
@@ -2945,57 +2884,23 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         else:
             self.state_leaves = self.state
 
-    def _apply_moe_lora_deltas(self, factors, meta):
-        """For RL framework integration: merge MoE LoRA deltas into the base
-        expert (and router) weights of a fused-MoE model (single-tenant).
+    def _set_moe_lora_factors(self, factors, meta):
+        """Replace the active GPT-OSS expert adapter's BF16 factor buffers.
 
-        ``factors`` is a flat dict of numpy f32 arrays keyed like
-        ``layers.{i}.{wi_0|wi_1|wo|router}.{lora_a|lora_b}`` (see
-        ``_compute_moe_lora_delta`` for shapes); ``meta`` carries ``scale``.
-
-        Incremental semantics: ``new_state = state + delta(new) - delta(prev)``
-        where ``prev`` is the factor dict from the previous call (None on the
-        first call, i.e. plain add). This keeps the merged weights equal to
-        ``base + delta(latest factors)`` without a pristine copy of the base.
-
-        Thin stateful wrapper around ``apply_moe_lora_deltas_to_state``:
-        tracks the previously merged factors/scale on ``self`` and keeps the
-        dispatch-side ``state_leaves`` view in sync.
-
-        ``factors`` may be a worker-local safetensors path or a dict of
-        arrays/nested lists; it is resolved HERE (not lazily) because the
-        resolved arrays — never the path, whose contents differ on every
-        push — must be retained as the previous factors for the next
-        incremental merge.
+        This never constructs a dense delta or mutates the MXFP4 base expert
+        tensors. ``factors`` may be a worker-local safetensors path, a dict,
+        or ``None`` to clear.
         """
-        if isinstance(self.state, nnx.State) or not isinstance(
-                self.state, dict):
-            raise RuntimeError(
-                "_apply_moe_lora_deltas only supports the vLLM (dict-state) "
-                f"model path; got state of type {type(self.state)}")
 
-        factors = _resolve_moe_lora_factors(factors)
-        scale = float(meta["scale"])
-        prev = getattr(self, "_moe_lora_prev", None)
-        prev_scale = float(getattr(self, "_moe_lora_prev_scale", scale))
-
-        result = apply_moe_lora_deltas_to_state(self.state, factors, meta,
-                                                prev, prev_scale)
-
-        # Keep the dispatch-side view in sync with the updated state so
-        # subsequent jit dispatches see the new weights (mirrors
-        # _sync_weights).
+        result = set_moe_lora_factors_in_state(self.state, factors, meta)
         if isinstance(self.state, nnx.State):
             self.state_leaves = tuple(jax.tree_util.tree_leaves(self.state))
         else:
             self.state_leaves = self.state
-
-        self._moe_lora_prev = factors
-        self._moe_lora_prev_scale = scale
         logger.info(
-            "MoE LoRA merge: applied deltas to %d layer(s) "
-            "(incremental=%s, scale=%s).", result["layers"],
-            result["incremental"], scale)
+            "MXFP4 expert LoRA buffers: updated %d layer(s) "
+            "(cleared=%s, base_weights_mutated=false).", result["layers"],
+            result["cleared"])
         return result
 
     def _get_padded_total_tokens(

@@ -23,11 +23,12 @@ from jax.sharding import PartitionSpec as P
 import tpu_inference.envs as envs
 from tpu_inference.kernels.collectives import \
     hierarchical_reduce_scatter as hier_rs
-from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2
+from tpu_inference.kernels.megablox.gmm_v2 import apply_act_fn, gmm_v2
 from tpu_inference.kernels.sparse_core.ragged_gather import ragged_gather
 from tpu_inference.kernels.sparse_core.ragged_gather_reduce import \
     ragged_gather_reduce
 from tpu_inference.layers.common.quantization import quantize_tensor
+from tpu_inference.layers.common.moe_lora import FusedMoELoRAWeights
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
 from tpu_inference.utils import get_mesh_shape_product
@@ -134,6 +135,55 @@ def valid_rows_mask(batch_size: int, group_sizes: jax.Array,
                      True, False)
 
 
+def apply_moe_lora_w13(
+    x: jax.Array,
+    base_w13: jax.Array,
+    lora: FusedMoELoRAWeights,
+    group_sizes: jax.Array,
+    group_offset: jax.Array,
+) -> jax.Array:
+    """Add gate/up LoRA deltas before the GPT-OSS activation.
+
+    ``x`` is already sorted by expert.  Qwix shares each input factor across
+    experts, so the two shrink projections are ordinary dense matmuls; the
+    per-expert expand factors reuse the base GMM grouping.  Keeping this
+    operation outside the MXFP4 weight tensor is essential: adding and
+    requantizing a small LoRA delta would discard information at FP4 block
+    precision.
+    """
+
+    gate_rank = x @ lora.gate_a
+    up_rank = x @ lora.up_a
+    gate_delta = gmm_wrapper(gate_rank, lora.gate_b, None, None, group_sizes,
+                             group_offset)
+    up_delta = gmm_wrapper(up_rank, lora.up_b, None, None, group_sizes,
+                           group_offset)
+    delta = jnp.concatenate((gate_delta, up_delta), axis=-1)
+    return base_w13 + delta.astype(base_w13.dtype) * lora.scale.astype(
+        base_w13.dtype)
+
+
+def apply_moe_lora_w2(
+    activated: jax.Array,
+    base_w2: jax.Array,
+    lora: FusedMoELoRAWeights,
+    group_sizes: jax.Array,
+    group_offset: jax.Array,
+) -> jax.Array:
+    """Add the down-projection LoRA delta before top-k reduction.
+
+    Under tensor parallelism each shard owns an intermediate slice.  Its
+    partial ``activated @ down_a @ down_b`` contribution is intentionally
+    left partial and is summed by the same final psum as the MXFP4 base W2.
+    """
+
+    down_rank = gmm_wrapper(activated, lora.down_a, None, None, group_sizes,
+                            group_offset)
+    down_delta = down_rank @ lora.down_b
+    return base_w2 + down_delta.astype(base_w2.dtype) * lora.scale.astype(
+        base_w2.dtype)
+
+
 def moe_gmm_local(x: jax.Array,
                   w1: jax.Array,
                   w1_scale: jax.Array | None,
@@ -141,6 +191,7 @@ def moe_gmm_local(x: jax.Array,
                   w2: jax.Array,
                   w2_scale: jax.Array | None,
                   w2_bias: jax.Array | None,
+                  lora_weights: FusedMoELoRAWeights | None,
                   group_sizes: jax.Array,
                   group_offset: jax.Array,
                   topk_argsort_revert_indices: jax.Array,
@@ -159,7 +210,9 @@ def moe_gmm_local(x: jax.Array,
 
     assert parallelism in ["tp", "ep"]
 
-    # GMM1 computes x @ (W_up | W_gate) together and activation, output is [tokens,padded_intermediate_size]
+    # With LoRA active the activation cannot remain fused into the MXFP4 W13
+    # GMM: the BF16 delta must be added to both projections first.  This is the
+    # same numerical boundary used by vLLM's GPT-OSS MXFP4 GPU kernels.
     gmm1_res = gmm_wrapper(
         x,
         w1,
@@ -167,9 +220,13 @@ def moe_gmm_local(x: jax.Array,
         w1_bias,
         group_sizes,
         group_offset,
-        fuse_act=activation,
+        fuse_act=None if lora_weights is not None else activation,
         preferred_element_type=x.dtype,
     )
+    if lora_weights is not None:
+        gmm1_res = apply_moe_lora_w13(x, gmm1_res, lora_weights, group_sizes,
+                                      group_offset)
+        gmm1_res = apply_act_fn(gmm1_res, activation)
 
     # When the parallelism is TP since w2_bias is not sharded, we should only apply bias
     # once, not applying to every shard. So we set w2_bias to 0 to all shards other than
@@ -180,6 +237,9 @@ def moe_gmm_local(x: jax.Array,
     gmm1_res = gmm1_res[:, :w2.shape[1]]  # trim to hidden size if padded
     gmm2_res = gmm_wrapper(gmm1_res, w2, w2_scale, w2_bias, group_sizes,
                            group_offset)
+    if lora_weights is not None:
+        gmm2_res = apply_moe_lora_w2(gmm1_res, gmm2_res, lora_weights,
+                                     group_sizes, group_offset)
 
     batch_size = gmm2_res.shape[0]
     local_group_size = w1.shape[0]
@@ -287,6 +347,7 @@ def tensor_parallel_gmm(
     w2: jax.Array,
     w2_scale: jax.Array | None,
     w2_bias: jax.Array | None,
+    lora_weights: FusedMoELoRAWeights | None,
     group_sizes: jax.Array,
     topk_argsort_revert_indices: jax.Array,
     topk_weights: jax.Array,
@@ -314,6 +375,15 @@ def tensor_parallel_gmm(
     w2_scale_spec = (None if num_blocks == 1 else P(
         None, ShardingAxisName.MLP_TENSOR, None, None))
     w2_bias_spec = None if w2_bias is None else P(None, None, None)
+    lora_spec = (None if lora_weights is None else FusedMoELoRAWeights(
+        gate_a=P(),
+        gate_b=P(None, None, ShardingAxisName.MLP_TENSOR),
+        up_a=P(),
+        up_b=P(None, None, ShardingAxisName.MLP_TENSOR),
+        down_a=P(None, ShardingAxisName.MLP_TENSOR, None),
+        down_b=P(),
+        scale=P(),
+    ))
 
     if scatter_results:
         final_out_specs = attn_data_p_spec
@@ -339,6 +409,7 @@ def tensor_parallel_gmm(
             w2_spec,
             w2_scale_spec,
             w2_bias_spec,
+            lora_spec,
             data_p_spec,
             P(),
             data_p_spec,
@@ -354,6 +425,7 @@ def tensor_parallel_gmm(
         w2,
         w2_scale,
         w2_bias,
+        lora_weights,
         group_sizes,
         group_offset,
         topk_argsort_revert_indices,
@@ -369,6 +441,7 @@ def expert_parallel_gmm(
     w2: jax.Array,
     w2_scale: jax.Array | None,
     w2_bias: jax.Array | None,
+    lora_weights: FusedMoELoRAWeights | None,
     group_sizes: jax.Array,
     topk_argsort_revert_indices: jax.Array,
     topk_weights: jax.Array,
@@ -393,6 +466,15 @@ def expert_parallel_gmm(
     w1_bias_spec = None if w1_bias is None else ep_p_spec
     w2_scale_spec = None if w2_scale is None else ep_p_spec
     w2_bias_spec = None if w2_bias is None else ep_p_spec
+    lora_spec = (None if lora_weights is None else FusedMoELoRAWeights(
+        gate_a=P(),
+        gate_b=ep_p_spec,
+        up_a=P(),
+        up_b=ep_p_spec,
+        down_a=ep_p_spec,
+        down_b=P(),
+        scale=P(),
+    ))
 
     if scatter_results:
         final_out_specs = attn_data_p_spec
@@ -420,6 +502,7 @@ def expert_parallel_gmm(
             ep_p_spec,
             w2_scale_spec,
             w2_bias_spec,
+            lora_spec,
             data_p_spec,
             ep_p_spec,
             data_p_spec,
@@ -435,6 +518,7 @@ def expert_parallel_gmm(
         w2,
         w2_scale,
         w2_bias,
+        lora_weights,
         group_sizes,
         group_offset,
         topk_argsort_revert_indices,
@@ -485,6 +569,7 @@ def fused_moe_func(
     w2_scale: jax.Array | None,
     w1_bias: jax.Array | None,
     w2_bias: jax.Array | None,
+    lora_weights: FusedMoELoRAWeights | None,
     gating_output: jax.Array,
     topk: int,
     renormalize: bool,
@@ -509,6 +594,9 @@ def fused_moe_func(
         w2_scale: w2 scale [num_experts, num_blocks, 1, hidden_size]
         w1_bias: optional bias of w1 [num_experts, 1, intermediate_size * 2]
         w2_bias: optional bias of w2 [num_experts, 1, hidden_size]
+        lora_weights: optional BF16 factors applied beside immutable base
+            expert weights. Only the single-active-adapter contract is
+            supported.
         gating_output: routing information of tokens [num_tokens, num_experts]
         topk: number of experts to choose per token.
         renormalize: normalize gating_output.
@@ -654,6 +742,7 @@ def fused_moe_func(
             w2,
             w2_scale,
             w2_bias,
+            lora_weights,
             group_sizes,
             topk_argsort_revert_indices,
             topk_weights,
@@ -673,6 +762,7 @@ def fused_moe_func(
             w2,
             w2_scale,
             w2_bias,
+            lora_weights,
             group_sizes,
             topk_argsort_revert_indices,
             topk_weights,

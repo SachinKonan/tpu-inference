@@ -600,11 +600,9 @@ class TPUWorker(WorkerBase):
                                                transpose_keys=transpose_keys,
                                                reshard_fn=reshard_fn)
 
-    def apply_moe_lora_deltas(self, factors, meta):
-        """Merge MoE LoRA deltas into the base expert weights (single-tenant,
-        incremental). Invoked via collective_rpc for RL framework
-        integration."""
-        return self.model_runner._apply_moe_lora_deltas(factors, meta)
+    def set_moe_lora_factors(self, factors, meta):
+        """Replace separate GPT-OSS MXFP4 expert-LoRA factor buffers."""
+        return self.model_runner._set_moe_lora_factors(factors, meta)
 
     def delete_kv_cache(self) -> None:
         self.model_runner.delete_kv_cache()
