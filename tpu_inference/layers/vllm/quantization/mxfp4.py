@@ -42,8 +42,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import \
 from tpu_inference.layers.common.moe import MoEBackend
 from tpu_inference.layers.common.moe_lora import FusedMoELoRAWeights
 from tpu_inference.layers.common.process_weights.moe_weights import (
-    FusedMoEWeights, process_moe_weights, quantize_moe_weights,
-    shard_moe_weights)
+    FusedMoEWeights, get_gmm_tp_w2_block_size, process_moe_weights,
+    quantize_moe_weights, shard_moe_weights)
 from tpu_inference.layers.common.quant_methods import MXFP4
 from tpu_inference.layers.common.quantization import \
     dequantize_tensor_from_mxfp4_packed
@@ -239,6 +239,18 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             w13_reorder_size = get_mesh_shape_product(
                 self.mesh, ShardingAxisName.MLP_TENSOR)
 
+            requant_block_size = REQUANTIZED_BLOCK_SIZE
+            if self.moe_backend == MoEBackend.GMM_TP:
+                # W2 scales are sharded by their block-count dimension.  The
+                # generic cap used by other quantized paths is not reached by
+                # this native MXFP4 loader, so choose a block count divisible
+                # by TP here as well (GPT-OSS 20B: 2880 / TP8 -> block 384,
+                # eight scale blocks).
+                w2_block_size = get_gmm_tp_w2_block_size(
+                    w2_weight.shape[2], REQUANTIZED_BLOCK_SIZE,
+                    w13_reorder_size)
+                requant_block_size = (REQUANTIZED_BLOCK_SIZE, w2_block_size)
+
             weights = quantize_moe_weights(
                 FusedMoEWeights(
                     w13_weight=w13_weight,
@@ -249,7 +261,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                     w2_bias=w2_bias,
                 ),
                 jnp.float4_e2m1fn,
-                REQUANTIZED_BLOCK_SIZE,
+                requant_block_size,
                 w13_interleave=w13_interleave,
             )
             return process_moe_weights(

@@ -25,11 +25,31 @@ from tpu_inference.layers.common.process_weights.linear_weights import (
     LinearWeights, shard_linear_weights)
 from tpu_inference.layers.common.process_weights.moe_weights import (
     FusedMoEWeights, W13PaddingConfig, _process_quantized_moe_weights_impl,
-    get_w13_padding_config, process_w13_for_gmm)
+    get_gmm_tp_w2_block_size, get_w13_padding_config,
+    process_w13_for_gmm)
 from tpu_inference.layers.common.sharding import ShardingAxisName
 
 
 class TestProcessWeights(unittest.TestCase):
+
+    def test_gmm_tp_w2_block_size_covers_gptoss20b_tp8(self):
+        block_size = get_gmm_tp_w2_block_size(2880, 512, 8)
+
+        self.assertEqual(block_size, 384)
+        self.assertEqual(
+            ((2880 + block_size - 1) // block_size) % 8,
+            0,
+        )
+
+    def test_gmm_tp_w2_block_size_prefers_no_padding_at_same_block_count(self):
+        self.assertEqual(get_gmm_tp_w2_block_size(2048, 512, 8), 256)
+
+    def test_gmm_tp_w2_block_size_handles_larger_intermediate_dimensions(self):
+        self.assertEqual(get_gmm_tp_w2_block_size(14336, 512, 8), 448)
+
+    def test_gmm_tp_w2_block_size_rejects_impossible_granularity(self):
+        with self.assertRaisesRegex(ValueError, "TP-shardable"):
+            get_gmm_tp_w2_block_size(16, 512, 8)
 
     def setUp(self):
         devices = jax.devices()

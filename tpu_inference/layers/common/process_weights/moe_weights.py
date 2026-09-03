@@ -199,6 +199,47 @@ def get_w13_padding_config(intermediate_size: int,
         padded_intermediate_size=padded_intermediate_size // outer_block_size)
 
 
+def get_gmm_tp_w2_block_size(
+    intermediate_size: int,
+    preferred_block_size: int,
+    tp_size: int,
+    quantum: int = 32,
+) -> int:
+    """Choose a W2 quantization block whose count is TP-shardable.
+
+    W2 is sharded on its contracting (intermediate) dimension.  Its scale
+    tensor is sharded on the corresponding block-count dimension, so merely
+    capping the block width to ``intermediate_size // tp_size`` is
+    insufficient: for GPT-OSS 20B, 2880 values requantized in blocks of 512
+    produce six scale blocks, which cannot be partitioned over TP=8.
+
+    Prefer the fewest blocks, then the least padding, while retaining the
+    MXFP4 32-value granularity.  For 2880 / TP=8 this selects 384, yielding
+    eight blocks and a padded intermediate size of 3072.
+    """
+
+    if intermediate_size <= 0 or preferred_block_size <= 0 or tp_size <= 0:
+        raise ValueError(
+            "intermediate size, block size, and TP size must be positive")
+    if quantum <= 0:
+        raise ValueError("quantization block quantum must be positive")
+
+    candidates = []
+    for block_size in range(quantum, preferred_block_size + 1, quantum):
+        num_blocks = (intermediate_size + block_size - 1) // block_size
+        if num_blocks % tp_size == 0:
+            padding = num_blocks * block_size - intermediate_size
+            candidates.append((num_blocks, padding, -block_size, block_size))
+    if not candidates:
+        raise ValueError(
+            "Unable to find a TP-shardable W2 quantization block size for "
+            f"intermediate_size={intermediate_size}, "
+            f"preferred_block_size={preferred_block_size}, tp_size={tp_size}, "
+            f"quantum={quantum}."
+        )
+    return min(candidates)[-1]
+
+
 def process_w13_for_gmm(tensor,
                         concat_dim: int,
                         config: W13PaddingConfig,
@@ -1105,10 +1146,8 @@ def _process_quantized_moe_weights_impl(
 
     if requant_block_size is not None and moe_backend == MoEBackend.GMM_TP:
         tp_size = get_mesh_shape_product(mesh, ShardingAxisName.MLP_TENSOR)
-        max_w2_block_size = orig_intermediate_size // tp_size
-
-        # Cap the block size to avoid sharding indivisible errors
-        w2_block_size = min(w2_block_size, max_w2_block_size)
+        w2_block_size = get_gmm_tp_w2_block_size(
+            orig_intermediate_size, w2_block_size, tp_size)
     hidden_size = align_to(orig_hidden_size, w13_block_size)
     intermediate_size = align_to(orig_intermediate_size, w2_block_size)
 
@@ -1220,8 +1259,8 @@ def process_unquantized_moe_weights(
                 tp_size = get_mesh_shape_product(mesh,
                                                  ShardingAxisName.MLP_TENSOR)
                 orig_intermediate_size = w2_weight.shape[1]
-                max_w2_block_size = orig_intermediate_size // tp_size
-                w2_block_size = min(requant_block_size, max_w2_block_size)
+                w2_block_size = get_gmm_tp_w2_block_size(
+                    orig_intermediate_size, requant_block_size, tp_size)
                 requant_block_size = (requant_block_size, w2_block_size)
         moe_logging_str = (
             "[MoE requantization]: re-quantizing MoE weights to "
