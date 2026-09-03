@@ -39,6 +39,7 @@ from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import \
     is_layer_skipped
 
+import tpu_inference.envs as envs
 from tpu_inference.layers.common.moe import MoEBackend
 from tpu_inference.layers.common.moe_lora import FusedMoELoRAWeights
 from tpu_inference.layers.common.process_weights.moe_weights import (
@@ -55,7 +56,7 @@ from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.layers.vllm.quantization.unquantized import \
     VllmUnquantizedLinearMethod
 from tpu_inference.logger import init_logger
-from tpu_inference.utils import get_mesh_shape_product, t2j
+from tpu_inference.utils import get_mesh_shape_product, t2j, to_jax_dtype
 
 REQUANTIZED_BLOCK_SIZE = 512
 
@@ -221,6 +222,16 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         w2_weight_scale = t2j(layer.w2_weight_scale, use_dlpack=False)
         w2_bias = t2j(layer.w2_bias, use_dlpack=False) if has_bias else None
 
+        desired_quant_dtype = (
+            to_jax_dtype(envs.MOE_REQUANTIZE_WEIGHT_DTYPE)
+            if envs.MOE_REQUANTIZE_WEIGHT_DTYPE else jnp.float4_e2m1fn)
+        preferred_requant_block_size = (envs.MOE_REQUANTIZE_BLOCK_SIZE
+                                        or REQUANTIZED_BLOCK_SIZE)
+        logger.info_once(
+            "Requantizing native MXFP4 experts for TPU execution "
+            "(dtype=%s, preferred_block_size=%d).", desired_quant_dtype,
+            preferred_requant_block_size)
+
         @jax.jit
         def process_mxfp4_moe_weights(
             w13_weight: jax.Array,
@@ -239,7 +250,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             w13_reorder_size = get_mesh_shape_product(
                 self.mesh, ShardingAxisName.MLP_TENSOR)
 
-            requant_block_size = REQUANTIZED_BLOCK_SIZE
+            requant_block_size = preferred_requant_block_size
             if self.moe_backend == MoEBackend.GMM_TP:
                 # W2 scales are sharded by their block-count dimension.  The
                 # generic cap used by other quantized paths is not reached by
@@ -247,9 +258,9 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 # by TP here as well (GPT-OSS 20B: 2880 / TP8 -> block 384,
                 # eight scale blocks).
                 w2_block_size = get_gmm_tp_w2_block_size(
-                    w2_weight.shape[2], REQUANTIZED_BLOCK_SIZE,
+                    w2_weight.shape[2], requant_block_size,
                     w13_reorder_size)
-                requant_block_size = (REQUANTIZED_BLOCK_SIZE, w2_block_size)
+                requant_block_size = (requant_block_size, w2_block_size)
 
             weights = quantize_moe_weights(
                 FusedMoEWeights(
@@ -260,7 +271,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                     w2_weight_scale=None,
                     w2_bias=w2_bias,
                 ),
-                jnp.float4_e2m1fn,
+                desired_quant_dtype,
                 requant_block_size,
                 w13_interleave=w13_interleave,
             )

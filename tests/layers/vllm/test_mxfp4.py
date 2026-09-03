@@ -141,10 +141,16 @@ def test_quant_override(model, mesh):
 @pytest.mark.parametrize("enable_attn_dp", [False, True])
 def test_mxfp4_fused_moe(num_devices, num_tokens, intermediate_size,
                          hidden_size, num_experts, topk, use_ep,
-                         enable_attn_dp):
+                         enable_attn_dp, monkeypatch):
     # Skip if enable_attn_dp is True but we don't have enough devices
     if enable_attn_dp and num_devices < 2:
         pytest.skip("enable_attn_dp requires at least 2 devices")
+
+    # TPU generations before v7 cannot execute native FP4 GMM kernels.  The
+    # checkpoint loader must honor the standard MoE runtime requantization
+    # override so those devices can use the supported FP8 kernel instead.
+    monkeypatch.setenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "fp8")
+    monkeypatch.setenv("MOE_REQUANTIZE_BLOCK_SIZE", "512")
 
     mesh = test_utils.get_spmd_mesh(num_devices, enable_attn_dp)
     torch.manual_seed(42)
@@ -214,6 +220,10 @@ def test_mxfp4_fused_moe(num_devices, num_tokens, intermediate_size,
 
         vllm_fused_moe.routed_experts.quant_method.process_weights_after_loading(
             vllm_fused_moe.routed_experts)
+        assert (t2j(vllm_fused_moe.routed_experts.w13_weight).dtype ==
+                jnp.float8_e4m3fn)
+        assert (t2j(vllm_fused_moe.routed_experts.w2_weight).dtype ==
+                jnp.float8_e4m3fn)
         actual = vllm_fused_moe(jax_a, score)
 
         torch.testing.assert_close(expected,
