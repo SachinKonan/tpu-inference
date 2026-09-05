@@ -1526,6 +1526,20 @@ def get_default_block_sizes(
                           num_kv_heads_x2)
 
     match tpu_version:
+        case 4:
+            # Preserve the conservative v4 defaults used by the pre-three-
+            # phase RPA v3 kernel. v4 has 16 MiB of VMEM, so larger v5/v6
+            # tiles can halt a core instead of reporting a clean OOM.
+            if case == RpaCase.DECODE:
+                bq_sz = 1
+                bkv_sz = min(512, max_kv)
+                bq_csz = 1
+                bkv_csz = min(512, max_kv)
+            else:
+                bq_sz = min(32, max_q)
+                bkv_sz = min(512, max_kv)
+                bq_csz = min(32, max_q)
+                bkv_csz = min(512, max_kv)
         case 5 | 6:
             if case == RpaCase.DECODE:
                 bq_sz = 1

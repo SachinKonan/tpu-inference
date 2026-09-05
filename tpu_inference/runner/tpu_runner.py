@@ -955,11 +955,27 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             cache_dtype = self.dtype
         kv_cache_dtype = to_jax_dtype(cache_dtype)
         kv_packing = common_utils.get_dtype_packing(kv_cache_dtype)
-        self.num_tokens_paddings = runner_utils.get_token_paddings(
-            min_token_size=max(16, next_power_of_2(self.dp_size * kv_packing)),
-            max_token_size=scheduler_config.max_num_batched_tokens *
-            self.dp_size,
-            padding_gap=vllm_envs.VLLM_TPU_BUCKET_PADDING_GAP)
+        min_token_size = max(16,
+                             next_power_of_2(self.dp_size * kv_packing))
+        max_token_size = (scheduler_config.max_num_batched_tokens *
+                          self.dp_size)
+        if envs.CUSTOM_NUM_TOKENS_BUCKETS:
+            custom_buckets = sorted(set(envs.CUSTOM_NUM_TOKENS_BUCKETS))
+            if (custom_buckets[0] != min_token_size or
+                    custom_buckets[-1] < max_token_size or
+                    any(bucket % self.dp_size for bucket in custom_buckets)):
+                raise ValueError(
+                    "CUSTOM_NUM_TOKENS_BUCKETS must contain positive, "
+                    f"DP-aligned values from at least {min_token_size} through "
+                    f"{max_token_size}; got {custom_buckets}")
+            self.num_tokens_paddings = custom_buckets
+            logger.info("Using custom token paddings: %s",
+                        self.num_tokens_paddings)
+        else:
+            self.num_tokens_paddings = runner_utils.get_token_paddings(
+                min_token_size=min_token_size,
+                max_token_size=max_token_size,
+                padding_gap=vllm_envs.VLLM_TPU_BUCKET_PADDING_GAP)
         self.num_tokens_paddings = sorted(self.num_tokens_paddings +
                                           additional_sizes)
         self.num_tokens_paddings_per_dp = [
@@ -1830,9 +1846,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         else:
             step_rng = self.rng_params_for_sampling
 
+        if envs.SERIALIZE_MODEL_AND_SAMPLING:
+            # v4 has limited runtime program memory. Finish the backbone before
+            # loading the sampler so both executables need not be resident
+            # concurrently.
+            jax.block_until_ready(logits)
+
         processed_bonus_logits = None
         if spec_decode_metadata is None:
-            logits = logits.astype(jnp.float32)
             with self.maybe_forbid_compile:
                 next_tokens, processed_logits = sample(
                     step_rng,
@@ -1870,11 +1891,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 key=rejection_rng,
             )
 
-        logits = logits.astype(jnp.float32)
-        if full_logits is not None:
-            full_logits = full_logits.astype(jnp.float32)
         with self.maybe_forbid_compile:
             if tpu_sampling_metadata.logprobs:
+                logits = logits.astype(jnp.float32)
                 if spec_decode_metadata is not None:
                     with jax.set_mesh(self.mesh):
                         if (self.model_config.logprobs_mode
@@ -1900,6 +1919,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             else:
                 logprobs = None
 
+            if (full_logits is not None and
+                    self.input_batch.num_prompt_logprobs):
+                full_logits = full_logits.astype(jnp.float32)
             prompt_logprobs_async = compute_prompt_logprobs(
                 full_logits,
                 input_ids,
@@ -2690,6 +2712,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 build_block_table_host(gid)
 
         metadata_blob, metadata_layout = self.device_buffer.build()
+        host_metadata = common_utils.DeviceBuffer.unpack_host_arrays(
+            metadata_blob, metadata_layout)
+        host_metadata_values = tuple(host_metadata[key]
+                                     for key in metadata_layout.keys)
 
         # Mamba slot ids are only consumed by hybrid attn+mamba models; for
         # pure-attention models, leaving the field None keeps AttentionMetadata
@@ -2713,18 +2739,19 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                         _num_reqs] = (global_slots %
                                                       local_slots)
             (request_distribution, mamba_state_indices,
-             dev_arrays_payload) = device_array(
-                 self.mesh, (request_distribution, mamba_state_indices_cpu,
-                             metadata_blob),
+             *dev_arrays_payload) = device_array(
+                 self.mesh,
+                 (request_distribution, mamba_state_indices_cpu,
+                  *host_metadata_values),
                  sharding=data_parallel_attn_sharding)
         else:
             mamba_state_indices = None
-            (request_distribution, dev_arrays_payload) = device_array(
-                self.mesh, (request_distribution, metadata_blob),
+            (request_distribution, *dev_arrays_payload) = device_array(
+                self.mesh, (request_distribution, *host_metadata_values),
                 sharding=data_parallel_attn_sharding)
 
-        metadata = common_utils.DeviceBuffer.unpack_arrays(
-            dev_arrays_payload, metadata_layout)
+        metadata = dict(
+            zip(metadata_layout.keys, dev_arrays_payload, strict=True))
         input_ids = metadata["input_ids"]
         query_start_loc = metadata["query_start_loc"]
         seq_lens = metadata["seq_lens"]

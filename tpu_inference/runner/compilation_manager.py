@@ -871,8 +871,12 @@ class CompilationManager:
             # function.
             sampling_metadata_sharding = NamedSharding(
                 self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
-            logits = self._create_dummy_tensor((num_reqs, hsize), jnp.float32,
-                                               logits_sharding)
+            # Runtime logits use the model dtype. Keep the cast to float32
+            # inside sample() so it shares the sampler executable instead of
+            # allocating a standalone TPU conversion program.
+            logits = self._create_dummy_tensor(
+                (num_reqs, hsize), self.runner.model_config.dtype,
+                logits_sharding)
             for do_sampling in (True, False):
                 for logprobs in (True, False):
                     if do_sampling:

@@ -23,8 +23,10 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
+from tpu_inference import envs
 import tpu_inference.layers.common.ragged_gated_delta_rule_wrapper as ragged_gated_delta_rule_wrapper
 from tpu_inference.kernels.causal_conv1d import causal_conv1d
+from tpu_inference.layers.common import ragged_conv1d_jax
 from tpu_inference.layers.common.ragged_gated_delta_rule_ref import \
     ragged_gated_delta_rule as ragged_gated_delta_rule_ref
 from tpu_inference.layers.common.sharding import ShardingAxisName
@@ -112,7 +114,10 @@ def run_jax_gdn_attention_local(
     query_lens = query_start_loc[1:max_reqs + 1] - query_start_loc[:max_reqs]
     has_initial_state = (seq_lens - query_lens) > 0
 
-    out_mixed_qkv, new_conv_state = causal_conv1d.ragged_causal_conv1d(
+    conv1d_impl = (ragged_conv1d_jax.ragged_conv1d
+                   if envs.USE_JAX_RAGGED_CONV1D else
+                   causal_conv1d.ragged_causal_conv1d)
+    out_mixed_qkv, new_conv_state = conv1d_impl(
         mixed_qkv,
         conv_state,
         conv_weight,
