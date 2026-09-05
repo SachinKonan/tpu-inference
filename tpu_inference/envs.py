@@ -36,10 +36,13 @@ if TYPE_CHECKING:
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = ""
     ATTN_BUCKETIZED_NUM_REQS: bool = False
     ATTN_CUSTOM_NUM_REQS_BUCKETS: list[int] = []
+    CUSTOM_NUM_TOKENS_BUCKETS: list[int] = []
+    SERIALIZE_MODEL_AND_SAMPLING: bool = False
     LAYOUT_Q_PROJ_AS_NDH: bool = False
     USE_JAX_PROFILER_SERVER: bool = False
     JAX_PROFILER_SERVER_PORT: int = 9999
     USE_BATCHED_RPA_KERNEL: bool = False
+    USE_JAX_RAGGED_CONV1D: bool = False
     FORCE_MOE_RANDOM_ROUTING: bool = False
     JITTED_MM_MODULE_KEYS: list[str] = []
     REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES: list[str] = []
@@ -298,6 +301,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # separated by comma. The max_reqs will alwasy be added to the buckets
     "ATTN_CUSTOM_NUM_REQS_BUCKETS":
     env_int_list("ATTN_CUSTOM_NUM_REQS_BUCKETS"),
+    "CUSTOM_NUM_TOKENS_BUCKETS":
+    env_int_list("CUSTOM_NUM_TOKENS_BUCKETS"),
+    "SERIALIZE_MODEL_AND_SAMPLING":
+    env_bool("SERIALIZE_MODEL_AND_SAMPLING"),
     # dictates whether to layout q-proj as NDH (q-heads, model dim, head dim)
     # or DNH (model dim, q-heads, head dim), which is the default (False)
     "LAYOUT_Q_PROJ_AS_NDH":
@@ -308,6 +315,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("JAX_PROFILER_SERVER_PORT") or "9999"),
     "USE_BATCHED_RPA_KERNEL":
     env_bool("USE_BATCHED_RPA_KERNEL"),
+    "USE_JAX_RAGGED_CONV1D":
+    env_bool("USE_JAX_RAGGED_CONV1D"),
     # Force random expert routing in MoE layers (for testing purposes only)
     "FORCE_MOE_RANDOM_ROUTING":
     env_bool("FORCE_MOE_RANDOM_ROUTING", default=False),

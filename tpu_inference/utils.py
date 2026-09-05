@@ -496,3 +496,12 @@ class DeviceBuffer:
         indices = tuple(np.cumsum(metadata.sizes)[:-1])
         parts = jnp.split(blob, indices)
         return {key: parts[i] for i, key in enumerate(metadata.keys)}
+
+    @staticmethod
+    def unpack_host_arrays(
+            blob: np.ndarray,
+            metadata: DeviceBufferMetadata) -> Dict[str, np.ndarray]:
+        """Unpack a host buffer without dispatching a TPU split program."""
+        indices = tuple(np.cumsum(metadata.sizes)[:-1])
+        parts = np.split(blob, indices)
+        return {key: parts[i] for i, key in enumerate(metadata.keys)}

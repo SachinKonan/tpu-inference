@@ -12,7 +12,7 @@ from jax.experimental.pallas import tpu as pltpu
 from torchax.ops.mappings import t2j as ref_t2j
 
 # Import the functions to be tested
-from tpu_inference.utils import (GBYTES, enable_megacore,
+from tpu_inference.utils import (GBYTES, DeviceBuffer, enable_megacore,
                                  get_jax_dtype_from_str_dtype, get_megacore,
                                  get_padded_head_dim, hbm_usage_bytes,
                                  hbm_usage_gb)
@@ -198,6 +198,19 @@ def test_get_jax_dtype_from_str_dtype():
     assert get_jax_dtype_from_str_dtype("fp8") == jnp.float8_e4m3fn
     assert get_jax_dtype_from_str_dtype("fp8_e4m3") == jnp.float8_e4m3fn
     assert get_jax_dtype_from_str_dtype("fp8_e5m2") == jnp.float8_e5m2
+
+
+def test_device_buffer_unpack_host_arrays():
+    buffer = DeviceBuffer(initial_capacity=8)
+    buffer.append(np.array([1, 2, 3], dtype=np.int32), key="tokens")
+    buffer.append(np.array([4, 5], dtype=np.int32), key="positions")
+
+    blob, metadata = buffer.build()
+    unpacked = DeviceBuffer.unpack_host_arrays(blob, metadata)
+
+    np.testing.assert_array_equal(unpacked["tokens"], [1, 2, 3])
+    np.testing.assert_array_equal(unpacked["positions"], [4, 5])
+    assert np.shares_memory(unpacked["tokens"], blob)
 
 
 # --- t2j tests ---
