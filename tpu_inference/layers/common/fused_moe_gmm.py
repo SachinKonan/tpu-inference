@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import functools
 from typing import Literal
 
@@ -139,6 +140,7 @@ def apply_moe_lora_w13(
     x: jax.Array,
     base_w13: jax.Array,
     lora: FusedMoELoRAWeights,
+    adapter_indices: jax.Array,
     group_sizes: jax.Array,
     group_offset: jax.Array,
 ) -> jax.Array:
@@ -152,21 +154,23 @@ def apply_moe_lora_w13(
     precision.
     """
 
-    gate_rank = x @ lora.gate_a
-    up_rank = x @ lora.up_a
-    gate_delta = gmm_wrapper(gate_rank, lora.gate_b, None, None, group_sizes,
-                             group_offset)
-    up_delta = gmm_wrapper(up_rank, lora.up_b, None, None, group_sizes,
-                           group_offset)
+    route = _prepare_moe_lora_routing(x.shape[0], adapter_indices,
+                                      group_sizes, group_offset,
+                                      lora.scale.shape[0])
+    gate_rank = _apply_slot_linear(x, lora.gate_a, adapter_indices)
+    up_rank = _apply_slot_linear(x, lora.up_a, adapter_indices)
+    gate_delta = _apply_expert_slot_linear(gate_rank, lora.gate_b, route)
+    up_delta = _apply_expert_slot_linear(up_rank, lora.up_b, route)
     delta = jnp.concatenate((gate_delta, up_delta), axis=-1)
-    return base_w13 + delta.astype(base_w13.dtype) * lora.scale.astype(
-        base_w13.dtype)
+    scale = _slot_scale(lora.scale, adapter_indices, base_w13.dtype)
+    return base_w13 + delta.astype(base_w13.dtype) * scale[:, None]
 
 
 def apply_moe_lora_w2(
     activated: jax.Array,
     base_w2: jax.Array,
     lora: FusedMoELoRAWeights,
+    adapter_indices: jax.Array,
     group_sizes: jax.Array,
     group_offset: jax.Array,
 ) -> jax.Array:
@@ -177,11 +181,97 @@ def apply_moe_lora_w2(
     left partial and is summed by the same final psum as the MXFP4 base W2.
     """
 
-    down_rank = gmm_wrapper(activated, lora.down_a, None, None, group_sizes,
-                            group_offset)
-    down_delta = down_rank @ lora.down_b
-    return base_w2 + down_delta.astype(base_w2.dtype) * lora.scale.astype(
-        base_w2.dtype)
+    route = _prepare_moe_lora_routing(activated.shape[0], adapter_indices,
+                                      group_sizes, group_offset,
+                                      lora.scale.shape[0])
+    down_rank = _apply_expert_slot_linear(activated, lora.down_a, route)
+    down_delta = _apply_slot_linear(down_rank, lora.down_b, adapter_indices)
+    scale = _slot_scale(lora.scale, adapter_indices, base_w2.dtype)
+    return base_w2 + down_delta.astype(base_w2.dtype) * scale[:, None]
+
+
+@dataclasses.dataclass(frozen=True)
+class _MoELoRARouting:
+    """Static-shape routing metadata for expert x physical-LoRA-slot GMMs."""
+
+    sort_indices: jax.Array
+    unsort_indices: jax.Array
+    group_sizes: jax.Array
+    group_offset: jax.Array
+
+
+def _slot_one_hot(adapter_indices: jax.Array, num_slots: int,
+                  dtype: jnp.dtype) -> jax.Array:
+    """Return slot selectors; Punica's ``-1`` base slot maps to all zeros."""
+
+    return jax.nn.one_hot(adapter_indices, num_slots, dtype=dtype)
+
+
+def _apply_slot_linear(x: jax.Array, weights: jax.Array,
+                       adapter_indices: jax.Array) -> jax.Array:
+    """Apply one matrix from a ``[slot, in, out]`` bank to every row."""
+
+    assert weights.ndim == 3
+    assert adapter_indices.shape == (x.shape[0], )
+    selectors = _slot_one_hot(adapter_indices, weights.shape[0], x.dtype)
+    return jnp.einsum("td,ts,sdr->tr", x, selectors, weights)
+
+
+def _slot_scale(scales: jax.Array, adapter_indices: jax.Array,
+                dtype: jnp.dtype) -> jax.Array:
+    selectors = _slot_one_hot(adapter_indices, scales.shape[0], dtype)
+    return selectors @ scales.astype(dtype)
+
+
+def _prepare_moe_lora_routing(
+    num_rows: int,
+    adapter_indices: jax.Array,
+    expert_group_sizes: jax.Array,
+    expert_group_offset: jax.Array,
+    num_slots: int,
+) -> _MoELoRARouting:
+    """Group already expert-sorted rows by ``(expert, LoRA slot)``.
+
+    Expert-major flattening preserves every expert boundary, so the base GMM
+    can keep its original ordering while the low-rank expert-specific factors
+    use ``num_experts * num_slots`` groups.  Base-model rows (slot ``-1``)
+    share slot zero's group only for shape purposes; their shared-factor
+    projection and scale are both exactly zero.
+    """
+
+    assert adapter_indices.shape == (num_rows, )
+    num_experts = expert_group_sizes.shape[0]
+    expert_indices = jnp.repeat(jnp.arange(num_experts, dtype=jnp.int32),
+                                expert_group_sizes,
+                                total_repeat_length=num_rows)
+    safe_slots = jnp.clip(adapter_indices, 0, num_slots - 1)
+    combined_indices = expert_indices * num_slots + safe_slots
+    sort_indices = jnp.argsort(combined_indices)
+    combined_group_sizes = jax.nn.one_hot(
+        combined_indices,
+        num_experts * num_slots,
+        dtype=jnp.int32,
+    ).sum(axis=0)
+    return _MoELoRARouting(
+        sort_indices=sort_indices,
+        unsort_indices=jnp.argsort(sort_indices),
+        group_sizes=combined_group_sizes,
+        group_offset=expert_group_offset * num_slots,
+    )
+
+
+def _apply_expert_slot_linear(x: jax.Array, weights: jax.Array,
+                              route: _MoELoRARouting) -> jax.Array:
+    """Apply ``[slot, expert, in, out]`` factors with grouped GMM."""
+
+    assert weights.ndim == 4
+    num_slots, num_local_experts, in_features, out_features = weights.shape
+    assert x.shape[1] == in_features
+    flattened = weights.transpose((1, 0, 2, 3)).reshape(
+        num_local_experts * num_slots, in_features, out_features)
+    sorted_output = gmm_wrapper(x[route.sort_indices], flattened, None, None,
+                                route.group_sizes, route.group_offset)
+    return sorted_output[route.unsort_indices]
 
 
 def moe_gmm_local(x: jax.Array,
@@ -192,6 +282,7 @@ def moe_gmm_local(x: jax.Array,
                   w2_scale: jax.Array | None,
                   w2_bias: jax.Array | None,
                   lora_weights: FusedMoELoRAWeights | None,
+                  adapter_indices: jax.Array,
                   group_sizes: jax.Array,
                   group_offset: jax.Array,
                   topk_argsort_revert_indices: jax.Array,
@@ -224,7 +315,8 @@ def moe_gmm_local(x: jax.Array,
         preferred_element_type=x.dtype,
     )
     if lora_weights is not None:
-        gmm1_res = apply_moe_lora_w13(x, gmm1_res, lora_weights, group_sizes,
+        gmm1_res = apply_moe_lora_w13(x, gmm1_res, lora_weights,
+                                      adapter_indices, group_sizes,
                                       group_offset)
         gmm1_res = apply_act_fn(gmm1_res, activation)
 
@@ -239,7 +331,8 @@ def moe_gmm_local(x: jax.Array,
                            group_offset)
     if lora_weights is not None:
         gmm2_res = apply_moe_lora_w2(gmm1_res, gmm2_res, lora_weights,
-                                     group_sizes, group_offset)
+                                     adapter_indices, group_sizes,
+                                     group_offset)
 
     batch_size = gmm2_res.shape[0]
     local_group_size = w1.shape[0]
@@ -348,6 +441,7 @@ def tensor_parallel_gmm(
     w2_scale: jax.Array | None,
     w2_bias: jax.Array | None,
     lora_weights: FusedMoELoRAWeights | None,
+    adapter_indices: jax.Array,
     group_sizes: jax.Array,
     topk_argsort_revert_indices: jax.Array,
     topk_weights: jax.Array,
@@ -377,10 +471,10 @@ def tensor_parallel_gmm(
     w2_bias_spec = None if w2_bias is None else P(None, None, None)
     lora_spec = (None if lora_weights is None else FusedMoELoRAWeights(
         gate_a=P(),
-        gate_b=P(None, None, ShardingAxisName.MLP_TENSOR),
+        gate_b=P(None, None, None, ShardingAxisName.MLP_TENSOR),
         up_a=P(),
-        up_b=P(None, None, ShardingAxisName.MLP_TENSOR),
-        down_a=P(None, ShardingAxisName.MLP_TENSOR, None),
+        up_b=P(None, None, None, ShardingAxisName.MLP_TENSOR),
+        down_a=P(None, None, ShardingAxisName.MLP_TENSOR, None),
         down_b=P(),
         scale=P(),
     ))
@@ -411,6 +505,7 @@ def tensor_parallel_gmm(
             w2_bias_spec,
             lora_spec,
             data_p_spec,
+            data_p_spec,
             P(),
             data_p_spec,
             data_p_spec,
@@ -426,6 +521,7 @@ def tensor_parallel_gmm(
         w2_scale,
         w2_bias,
         lora_weights,
+        adapter_indices,
         group_sizes,
         group_offset,
         topk_argsort_revert_indices,
@@ -442,6 +538,7 @@ def expert_parallel_gmm(
     w2_scale: jax.Array | None,
     w2_bias: jax.Array | None,
     lora_weights: FusedMoELoRAWeights | None,
+    adapter_indices: jax.Array,
     group_sizes: jax.Array,
     topk_argsort_revert_indices: jax.Array,
     topk_weights: jax.Array,
@@ -468,10 +565,10 @@ def expert_parallel_gmm(
     w2_bias_spec = None if w2_bias is None else ep_p_spec
     lora_spec = (None if lora_weights is None else FusedMoELoRAWeights(
         gate_a=P(),
-        gate_b=ep_p_spec,
+        gate_b=P(None, ShardingAxisName.EXPERT),
         up_a=P(),
-        up_b=ep_p_spec,
-        down_a=ep_p_spec,
+        up_b=P(None, ShardingAxisName.EXPERT),
+        down_a=P(None, ShardingAxisName.EXPERT),
         down_b=P(),
         scale=P(),
     ))
@@ -504,6 +601,7 @@ def expert_parallel_gmm(
             w2_bias_spec,
             lora_spec,
             data_p_spec,
+            data_p_spec,
             ep_p_spec,
             data_p_spec,
             data_p_spec,
@@ -519,6 +617,7 @@ def expert_parallel_gmm(
         w2_scale,
         w2_bias,
         lora_weights,
+        adapter_indices,
         group_sizes,
         group_offset,
         topk_argsort_revert_indices,
@@ -570,6 +669,7 @@ def fused_moe_func(
     w1_bias: jax.Array | None,
     w2_bias: jax.Array | None,
     lora_weights: FusedMoELoRAWeights | None,
+    adapter_indices: jax.Array | None,
     gating_output: jax.Array,
     topk: int,
     renormalize: bool,
@@ -594,9 +694,10 @@ def fused_moe_func(
         w2_scale: w2 scale [num_experts, num_blocks, 1, hidden_size]
         w1_bias: optional bias of w1 [num_experts, 1, intermediate_size * 2]
         w2_bias: optional bias of w2 [num_experts, 1, hidden_size]
-        lora_weights: optional BF16 factors applied beside immutable base
-            expert weights. Only the single-active-adapter contract is
-            supported.
+        lora_weights: optional BF16 factor banks applied beside immutable base
+            expert weights.
+        adapter_indices: vLLM physical LoRA slot for each token, or ``-1`` for
+            the base model. Required when ``lora_weights`` is present.
         gating_output: routing information of tokens [num_tokens, num_experts]
         topk: number of experts to choose per token.
         renormalize: normalize gating_output.
@@ -618,6 +719,15 @@ def fused_moe_func(
         f"16 but got {num_tokens}*{topk}={num_tokens*topk}")
 
     assert gating_output.shape == (num_tokens, global_num_experts)
+    if lora_weights is not None and adapter_indices is None:
+        raise ValueError(
+            "Fused expert LoRA requires per-token physical adapter slots.")
+    if adapter_indices is None:
+        adapter_indices = jnp.full((num_tokens, ), -1, dtype=jnp.int32)
+    if adapter_indices.shape != (num_tokens, ):
+        raise ValueError(
+            "adapter_indices must have one entry per MoE token; got "
+            f"{adapter_indices.shape} for {num_tokens} tokens.")
 
     topk_weights = apply_scoring_fn(scoring_fn, gating_output)
     if hash_based_topk_indices is not None:
@@ -643,6 +753,9 @@ def fused_moe_func(
     if get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) > 1:
         topk_indices, topk_weights = all_gather_topk_indices_and_weights(
             topk_indices, topk_weights, dtype, mesh)
+        adapter_indices = jax.lax.with_sharding_constraint(
+            adapter_indices,
+            NamedSharding(mesh, P(ShardingAxisName.MLP_DATA)))
     topk_weights = topk_weights.astype(dtype)
     topk_weights = jax.lax.with_sharding_constraint(
         topk_weights, NamedSharding(mesh, P(ShardingAxisName.MLP_DATA, None)))
@@ -662,13 +775,16 @@ def fused_moe_func(
         topk_indices = _override_token_indices_for_random_routing(
             topk_indices, global_num_experts)
 
-    def _process_tokens_locally(hidden_states_local, topk_indices_local):
+    def _process_tokens_locally(hidden_states_local, topk_indices_local,
+                                adapter_indices_local):
         num_tokens_local = hidden_states_local.shape[0]
         topk_indices_flat = topk_indices_local.flatten()
         topk_argsort_indices = jnp.argsort(topk_indices_flat)
         token_indices = jnp.arange(num_tokens_local,
                                    dtype=jnp.int32).repeat(topk)
         token_indices_sorted = token_indices[topk_argsort_indices]
+        adapter_indices_sorted = jnp.repeat(
+            adapter_indices_local, topk)[topk_argsort_indices]
         # Below one_hot is equivalent to jnp.bincount(topk_indices_flat,
         # length=global_num_experts) but is more performant.
         group_sizes_local = jax.nn.one_hot(topk_indices_flat,
@@ -706,25 +822,28 @@ def fused_moe_func(
         else:
             x = hidden_states_local[token_indices_sorted]
 
-        return x, group_sizes_local, topk_argsort_revert_indices
+        return (x, adapter_indices_sorted, group_sizes_local,
+                topk_argsort_revert_indices)
 
     if all_gather_fp8:
         hidden_states = _apply_all_gather_fp8(hidden_states, mesh, dtype)
 
-    x, group_sizes, topk_argsort_revert_indices = jax.shard_map(
+    x, adapter_indices_sorted, group_sizes, topk_argsort_revert_indices = jax.shard_map(
         _process_tokens_locally,
         mesh=mesh,
         in_specs=(
             P(ShardingAxisName.MLP_DATA, None),
             P(ShardingAxisName.MLP_DATA, None),
+            P(ShardingAxisName.MLP_DATA),
         ),
         out_specs=(
             P(ShardingAxisName.MLP_DATA),
             P(ShardingAxisName.MLP_DATA),
             P(ShardingAxisName.MLP_DATA),
+            P(ShardingAxisName.MLP_DATA),
         ),
         check_vma=False,
-    )(hidden_states, topk_indices)
+    )(hidden_states, topk_indices, adapter_indices)
 
     try:
         x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
@@ -743,6 +862,7 @@ def fused_moe_func(
             w2_scale,
             w2_bias,
             lora_weights,
+            adapter_indices_sorted,
             group_sizes,
             topk_argsort_revert_indices,
             topk_weights,
@@ -763,6 +883,7 @@ def fused_moe_func(
             w2_scale,
             w2_bias,
             lora_weights,
+            adapter_indices_sorted,
             group_sizes,
             topk_argsort_revert_indices,
             topk_weights,

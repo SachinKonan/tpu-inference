@@ -87,6 +87,38 @@ class TPULRUCacheWorkerLoRAManager(LRUCacheWorkerLoRAManager):
 
     _manager_cls: type[LRUCacheLoRAModelManager] = TPULRUCacheLoRAModelManager
 
+    def set_moe_lora_slot_callback(self, callback) -> None:
+        """Install a callback invoked when vLLM assigns a physical slot.
+
+        MXFP4 expert factors are not ordinary vLLM LoRA modules, but they must
+        follow the exact same LRU slot ownership. The callback lets the model
+        runner restore or clear the matching expert-factor bank whenever an
+        adapter is reactivated in a different slot.
+        """
+
+        self._moe_lora_slot_callback = callback
+        self._moe_lora_slot_owners = [None] * self._adapter_manager.lora_slots
+
+    def mark_moe_lora_slot(self, slot: int, lora_id: int) -> None:
+        """Record a direct RPC install so the next request need not reload."""
+
+        owners = getattr(self, "_moe_lora_slot_owners", None)
+        if owners is not None:
+            owners[slot] = lora_id
+
+    def add_adapter(self, lora_request) -> bool:
+        loaded = super().add_adapter(lora_request)
+        callback = getattr(self, "_moe_lora_slot_callback", None)
+        if callback is None:
+            return loaded
+
+        lora_id = int(lora_request.lora_int_id)
+        slot = self._adapter_manager.lora_index_to_id.index(lora_id)
+        if self._moe_lora_slot_owners[slot] != lora_id:
+            callback(lora_id, slot)
+            self._moe_lora_slot_owners[slot] = lora_id
+        return loaded
+
     def add_dummy_lora(self, lora_request, rank: int) -> bool:
         with torchax.default_env():
             return super().add_dummy_lora(lora_request, rank)

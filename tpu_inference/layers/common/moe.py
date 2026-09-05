@@ -155,6 +155,8 @@ def moe_apply(
                     w1_bias=weights.w13_bias,
                     w2_bias=weights.w2_bias,
                     lora_weights=lora_weights,
+                    adapter_indices=extra_backend_kwargs.get(
+                        "adapter_indices", None),
                     gating_output=gating_output,
                     topk=layer.top_k,
                     renormalize=layer.renormalize,

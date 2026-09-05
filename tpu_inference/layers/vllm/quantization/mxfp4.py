@@ -134,11 +134,11 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
 
     def _create_lora_buffers(self, layer: RoutedExperts,
                              weights: FusedMoEWeights) -> None:
-        """Create fixed-shape BF16 factor buffers before JAX compilation.
+        """Create fixed-shape BF16 factor banks before JAX compilation.
 
-        Expert adapters are single-active-adapter on TPU for now.  Buffer
-        shapes use ``max_lora_rank`` so swapping checkpoints changes values,
-        never the model pytree or executable signature.
+        Buffer shapes use ``max_loras`` and ``max_lora_rank`` so loading or
+        evicting adapters changes values, never the model pytree or executable
+        signature.  The slot axis matches vLLM/Punica's physical LoRA slots.
         """
 
         if self.lora_config is None:
@@ -163,6 +163,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                 "intermediate input, got "
                 f"{fused_intermediate} and {padded_intermediate}.")
         max_rank = int(self.lora_config.max_lora_rank)
+        max_loras = int(self.lora_config.max_loras)
 
         if self.moe_backend == MoEBackend.GMM_EP:
             expert_spec = P(ShardingAxisName.EXPERT)
@@ -173,16 +174,19 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
             down_a_spec = P(None, ShardingAxisName.MLP_TENSOR, None)
 
         shapes_and_specs = {
-            "gate_a": ((padded_hidden, max_rank), P()),
+            "gate_a": ((max_loras, padded_hidden, max_rank), P()),
             "gate_b":
-            ((num_experts, max_rank, padded_intermediate), gate_b_spec),
-            "up_a": ((padded_hidden, max_rank), P()),
+            ((max_loras, num_experts, max_rank, padded_intermediate),
+             P(None, *gate_b_spec)),
+            "up_a": ((max_loras, padded_hidden, max_rank), P()),
             "up_b":
-            ((num_experts, max_rank, padded_intermediate), gate_b_spec),
+            ((max_loras, num_experts, max_rank, padded_intermediate),
+             P(None, *gate_b_spec)),
             "down_a":
-            ((num_experts, padded_intermediate, max_rank), down_a_spec),
-            "down_b": ((max_rank, padded_hidden), P()),
-            "scale": ((), P()),
+            ((max_loras, num_experts, padded_intermediate, max_rank),
+             P(None, *down_a_spec)),
+            "down_b": ((max_loras, max_rank, padded_hidden), P()),
+            "scale": ((max_loras, ), P()),
         }
         for field, (shape, spec) in shapes_and_specs.items():
             value = general_device_put(
@@ -193,9 +197,9 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
                                   torch_view(value),
                                   persistent=False)
         logger.info_once(
-            "Allocated separate BF16 MXFP4 expert-LoRA buffers "
-            "(max_rank=%d, backend=%s); base expert weights remain immutable.",
-            max_rank, self.moe_backend.value)
+            "Allocated separate BF16 MXFP4 expert-LoRA banks "
+            "(max_loras=%d, max_rank=%d, backend=%s); base expert weights "
+            "remain immutable.", max_loras, max_rank, self.moe_backend.value)
 
     def get_fused_moe_quant_config(
             self, layer: torch.nn.Module) -> FusedMoEQuantConfig | None:

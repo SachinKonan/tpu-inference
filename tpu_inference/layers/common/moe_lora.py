@@ -21,17 +21,22 @@ import jax
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class FusedMoELoRAWeights:
-    """Single-active-adapter LoRA factors for fused GPT-OSS experts.
+    """Multi-adapter LoRA factor banks for fused GPT-OSS experts.
 
     The MXFP4 base tensors stay immutable. These BF16 factors are consumed
     beside the base GMMs, using the already-sorted expert token groups. Gate
     and up ``A`` factors and the down ``B`` factor are shared across experts,
     matching MaxText/Qwix's GPT-OSS parameterization.
 
-    Shapes (E=experts, H=padded hidden, I=padded intermediate, R=max rank):
-      gate_a/up_a: (H, R)       gate_b/up_b: (E, R, I)
-      down_a:      (E, I, R)    down_b:      (R, H)
-      scale: scalar
+    The leading ``S`` axis is the vLLM physical LoRA slot.  Request-time
+    Punica metadata selects a slot independently for every token; ``-1``
+    means the immutable base model and produces an exactly zero delta.
+
+    Shapes (S=slots, E=experts, H=padded hidden, I=padded intermediate,
+    R=max rank):
+      gate_a/up_a: (S, H, R)       gate_b/up_b: (S, E, R, I)
+      down_a:      (S, E, I, R)    down_b:      (S, R, H)
+      scale: (S,)
     """
 
     gate_a: Any

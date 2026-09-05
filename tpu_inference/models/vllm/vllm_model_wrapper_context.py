@@ -27,6 +27,7 @@ class VllmModelWrapperContext:
     mesh: Mesh
     layer_name_to_kvcache_index: Dict[str, int]
     vllm_config: Optional[VllmConfig] = None
+    lora_token_indices: Optional[jax.Array] = None
     expert_indices_list: List[jax.Array] = field(default_factory=list)
 
 
@@ -48,6 +49,7 @@ def set_vllm_model_wrapper_context(
     mesh: Mesh,
     layer_name_to_kvcache_index: Dict[str, int] = None,
     vllm_config: Optional[VllmConfig] = None,
+    lora_token_indices: Optional[jax.Array] = None,
 ):
     global _vllm_model_wrapper_context
     prev_context = _vllm_model_wrapper_context
@@ -56,6 +58,7 @@ def set_vllm_model_wrapper_context(
         mesh=mesh,
         layer_name_to_kvcache_index=layer_name_to_kvcache_index,
         vllm_config=vllm_config,
+        lora_token_indices=lora_token_indices,
     )
 
     try:

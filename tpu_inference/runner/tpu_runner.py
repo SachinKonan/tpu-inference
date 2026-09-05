@@ -207,52 +207,95 @@ def _find_moe_lora_buffer_key(state, layer_idx: int, field: str) -> str:
     return matches[0]
 
 
-def _replace_moe_lora_buffer(
+def _replace_moe_lora_slot(
     state,
     key: str,
+    slot: int,
     source: np.ndarray | float | None,
-    starts: tuple[int, ...] = ()) -> None:
-    """Replace one factor buffer, zero-padding to its compile-time shape."""
+    starts: tuple[int, ...] = (),
+) -> None:
+    """Replace one factor-bank slot while preserving every other adapter."""
 
     from torchax.interop import jax_view, torch_view
 
     raw = state[key]
     is_torch_view = isinstance(raw, torch.Tensor)
     arr = jax_view(raw) if is_torch_view else raw
+    _validate_moe_lora_slot_update(arr, key, slot, source, starts)
+    slot_shape = arr.shape[1:]
     if source is None:
-        updated = jnp.zeros(arr.shape, dtype=arr.dtype)
-        sharding = getattr(arr, "sharding", None)
-        if sharding is not None:
-            updated = jax.device_put(updated, sharding)
-        state[key] = torch_view(updated) if is_torch_view else updated
-        return
-    source_arr = jnp.asarray(source, dtype=arr.dtype)
-    if source_arr.ndim != arr.ndim or len(starts) != arr.ndim:
-        raise ValueError(
-            f"Factor for {key!r} has shape {source_arr.shape}; target is "
-            f"{arr.shape}.")
-    if any(start < 0 or start + size > target for start, size, target in zip(
-            starts, source_arr.shape, arr.shape)):
-        raise ValueError(
-            f"Factor for {key!r} with shape {source_arr.shape} does not fit "
-            f"target {arr.shape} at {starts}.")
-    slices = tuple(
-        slice(start, start + size)
-        for start, size in zip(starts, source_arr.shape))
-    updated = jnp.zeros(arr.shape, dtype=arr.dtype).at[slices].set(source_arr)
+        slot_value = jnp.zeros(slot_shape, dtype=arr.dtype)
+    else:
+        source_arr = jnp.asarray(source, dtype=arr.dtype)
+        slices = tuple(
+            slice(start, start + size)
+            for start, size in zip(starts, source_arr.shape))
+        slot_value = jnp.zeros(slot_shape,
+                               dtype=arr.dtype).at[slices].set(source_arr)
+    updated = arr.at[slot].set(slot_value)
     sharding = getattr(arr, "sharding", None)
     if sharding is not None:
         updated = jax.device_put(updated, sharding)
     state[key] = torch_view(updated) if is_torch_view else updated
 
 
-def set_moe_lora_factors_in_state(state, factors, meta):
+def _validate_moe_lora_slot_update(
+    arr,
+    key: str,
+    slot: int,
+    source: np.ndarray | float | None,
+    starts: tuple[int, ...],
+) -> None:
+    """Validate one pending bank update without changing model state."""
+
+    if arr.ndim < 1:
+        raise ValueError(f"Expert LoRA bank {key!r} has no slot axis.")
+    if not 0 <= slot < arr.shape[0]:
+        raise ValueError(
+            f"Expert LoRA slot {slot} is outside [0, {arr.shape[0]}).")
+    slot_shape = arr.shape[1:]
+    if source is None:
+        return
+    source_shape = np.shape(source)
+    if len(source_shape) != len(slot_shape) or len(starts) != len(slot_shape):
+        raise ValueError(
+            f"Factor for {key!r} has shape {source_shape}; target slot is "
+            f"{slot_shape}.")
+    if any(start < 0 or start + size > target
+           for start, size, target in zip(starts, source_shape, slot_shape)):
+        raise ValueError(
+            f"Factor for {key!r} with shape {source_shape} does not fit "
+            f"target slot {slot_shape} at {starts}.")
+
+
+def _validate_moe_lora_slot_banks(state, layers: set[int]) -> int:
+    """Return the common physical-slot capacity of every expert bank."""
+
+    from torchax.interop import jax_view
+
+    capacities = set()
+    for layer_idx in layers:
+        for field in ("gate_a", "gate_b", "up_a", "up_b", "down_a",
+                      "down_b", "scale"):
+            key = _find_moe_lora_buffer_key(state, layer_idx, field)
+            raw = state[key]
+            arr = jax_view(raw) if isinstance(raw, torch.Tensor) else raw
+            if arr.ndim < 1:
+                raise ValueError(f"Expert LoRA bank {key!r} has no slot axis.")
+            capacities.add(arr.shape[0])
+    if len(capacities) != 1:
+        raise ValueError(
+            f"Inconsistent expert LoRA slot capacities: {sorted(capacities)}")
+    return capacities.pop()
+
+
+def set_moe_lora_factors_in_state(state, factors, meta, slot: int = 0):
     """Install separate BF16 GPT-OSS expert factors without touching MXFP4.
 
     The state pytree contains fixed-size, correctly sharded buffers allocated
-    while the MXFP4 model is loaded.  This function replaces their values for
-    the one globally active expert adapter.  Missing expert components are
-    zeroed, and ``factors=None`` clears the adapter.  Router LoRA is purposely
+    while the MXFP4 model is loaded.  This function replaces one physical
+    vLLM slot while preserving all other adapters. Missing expert components
+    are zeroed, and ``factors=None`` clears the slot. Router LoRA is purposely
     absent here: the GPT-OSS router is BF16 and is handled by vLLM's ordinary
     ``ReplicatedLinearWithLoRA`` path.
     """
@@ -268,6 +311,10 @@ def set_moe_lora_factors_in_state(state, factors, meta):
         raise RuntimeError(
             "No separate MXFP4 expert-LoRA buffers were found. Start the "
             "server with --enable-lora and the GMM_TP or GMM_EP backend.")
+    capacity = _validate_moe_lora_slot_banks(state, buffer_layers)
+    if not 0 <= slot < capacity:
+        raise ValueError(
+            f"Expert LoRA slot {slot} is outside [0, {capacity}).")
 
     expert_layers = {
         layer
@@ -292,6 +339,7 @@ def set_moe_lora_factors_in_state(state, factors, meta):
         return (np.asarray(values["lora_a"], dtype=np.float32),
                 np.asarray(values["lora_b"], dtype=np.float32))
 
+    pending_updates = []
     for layer_idx in sorted(buffer_layers):
         gate = pair(layer_idx, "wi_0")
         up = pair(layer_idx, "wi_1")
@@ -336,16 +384,29 @@ def set_moe_lora_factors_in_state(state, factors, meta):
             key = _find_moe_lora_buffer_key(state, layer_idx, field)
             source = placements.get(field)
             starts = () if source is None else (0, ) * source.ndim
-            _replace_moe_lora_buffer(state, key, source, starts)
+            pending_updates.append((key, source, starts))
 
         scale_key = _find_moe_lora_buffer_key(state, layer_idx, "scale")
-        _replace_moe_lora_buffer(state, scale_key,
-                                 np.asarray(scale, np.float32), ())
+        pending_updates.append(
+            (scale_key, np.asarray(scale, np.float32), ()))
+
+    # Reject a malformed sidecar before mutating any layer. This keeps the
+    # adapter install transactional from the running model's point of view.
+    from torchax.interop import jax_view
+
+    for key, source, starts in pending_updates:
+        raw = state[key]
+        arr = jax_view(raw) if isinstance(raw, torch.Tensor) else raw
+        _validate_moe_lora_slot_update(arr, key, slot, source, starts)
+    for key, source, starts in pending_updates:
+        _replace_moe_lora_slot(state, key, slot, source, starts)
 
     return {
         "layers": len(buffer_layers),
         "cleared": resolved is None,
         "base_weights_mutated": False,
+        "slot": slot,
+        "capacity": capacity,
     }
 
 
@@ -1118,6 +1179,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.state_leaves = model.state_leaves
         self.lora_manager = model.lora_manager
         self.model = model.model
+        self._moe_lora_registry = {}
+        if (self.lora_manager is not None
+                and _moe_lora_buffer_layers(self.state)):
+            self.lora_manager.set_moe_lora_slot_callback(
+                self._restore_moe_lora_slot)
 
         self.precompile_vision_encoder_fn = model.multimodal_fns.precompile_vision_encoder_fn
         self.embed_multimodal_fn = model.multimodal_fns.embed_multimodal_fn
@@ -2884,23 +2950,62 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         else:
             self.state_leaves = self.state
 
-    def _set_moe_lora_factors(self, factors, meta):
-        """Replace the active GPT-OSS expert adapter's BF16 factor buffers.
+    def _refresh_moe_lora_state_leaves(self) -> None:
+        if isinstance(self.state, nnx.State):
+            self.state_leaves = tuple(jax.tree_util.tree_leaves(self.state))
+        else:
+            self.state_leaves = self.state
+
+    def _restore_moe_lora_slot(self, lora_id: int, slot: int) -> None:
+        """Follow vLLM LRU activation by restoring the same expert slot."""
+
+        factors, meta = self._moe_lora_registry.get(lora_id, (None, {
+            "scale": 0.0
+        }))
+        set_moe_lora_factors_in_state(self.state,
+                                      factors,
+                                      meta,
+                                      slot=slot)
+        self._refresh_moe_lora_state_leaves()
+
+    def _set_moe_lora_factors(self, factors, meta, lora_id=None):
+        """Replace one GPT-OSS adapter's BF16 expert-factor slot.
 
         This never constructs a dense delta or mutates the MXFP4 base expert
         tensors. ``factors`` may be a worker-local safetensors path, a dict,
         or ``None`` to clear.
         """
 
-        result = set_moe_lora_factors_in_state(self.state, factors, meta)
-        if isinstance(self.state, nnx.State):
-            self.state_leaves = tuple(jax.tree_util.tree_leaves(self.state))
-        else:
-            self.state_leaves = self.state
+        slot = 0
+        if lora_id is not None:
+            adapter_manager = getattr(self.lora_manager, "_adapter_manager",
+                                      None)
+            index_to_id = getattr(adapter_manager, "lora_index_to_id", None)
+            if index_to_id is None:
+                raise RuntimeError(
+                    "Cannot resolve an expert LoRA slot without vLLM's "
+                    "active adapter manager.")
+            try:
+                slot = index_to_id.index(int(lora_id))
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"LoRA id {lora_id} has no active physical slot; active "
+                    f"mapping is {index_to_id}.") from exc
+
+        if lora_id is not None:
+            self._moe_lora_registry[int(lora_id)] = (factors, dict(meta or {}))
+        result = set_moe_lora_factors_in_state(self.state,
+                                               factors,
+                                               meta,
+                                               slot=slot)
+        result["lora_id"] = lora_id
+        self._refresh_moe_lora_state_leaves()
+        if lora_id is not None:
+            self.lora_manager.mark_moe_lora_slot(slot, int(lora_id))
         logger.info(
-            "MXFP4 expert LoRA buffers: updated %d layer(s) "
-            "(cleared=%s, base_weights_mutated=false).", result["layers"],
-            result["cleared"])
+            "MXFP4 expert LoRA buffers: updated %d layer(s), slot=%d, "
+            "lora_id=%s (cleared=%s, base_weights_mutated=false).",
+            result["layers"], result["slot"], lora_id, result["cleared"])
         return result
 
     def _get_padded_total_tokens(

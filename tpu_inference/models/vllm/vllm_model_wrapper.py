@@ -417,7 +417,10 @@ class VllmModelWrapper:
                     kv_caches=kv_caches,
                     mesh=self.mesh,
                     layer_name_to_kvcache_index=layer_name_to_kvcache_index,
-                    vllm_config=self.vllm_config), set_forward_context(
+                    vllm_config=self.vllm_config,
+                    lora_token_indices=(
+                        lora_metadata.get("_token_lora_indices")
+                        if isinstance(lora_metadata, dict) else None)), set_forward_context(
                         attn_metadata=attn_metadata,
                         vllm_config=self.vllm_config):
                 # We need to wrap args from jax land into TorchValue with

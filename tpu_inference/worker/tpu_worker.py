@@ -600,9 +600,10 @@ class TPUWorker(WorkerBase):
                                                transpose_keys=transpose_keys,
                                                reshard_fn=reshard_fn)
 
-    def set_moe_lora_factors(self, factors, meta):
-        """Replace separate GPT-OSS MXFP4 expert-LoRA factor buffers."""
-        return self.model_runner._set_moe_lora_factors(factors, meta)
+    def set_moe_lora_factors(self, factors, meta, lora_id=None):
+        """Replace one GPT-OSS MXFP4 expert-LoRA physical slot."""
+        return self.model_runner._set_moe_lora_factors(
+            factors, meta, lora_id=lora_id)
 
     def delete_kv_cache(self) -> None:
         self.model_runner.delete_kv_cache()

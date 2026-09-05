@@ -25,6 +25,7 @@ from tpu_inference.runner.tpu_runner import set_moe_lora_factors_in_state
 
 E, H, I, R = 2, 3, 2, 2
 H_PAD, I_PAD, R_MAX = 4, 4, 4
+SLOTS = 3
 
 
 def _key(layer, field):
@@ -39,19 +40,19 @@ def _state():
     for layer in range(2):
         state.update({
             _key(layer, "gate_a"):
-            jnp.ones((H_PAD, R_MAX), jnp.bfloat16),
+            jnp.ones((SLOTS, H_PAD, R_MAX), jnp.bfloat16),
             _key(layer, "gate_b"):
-            jnp.ones((E, R_MAX, I_PAD), jnp.bfloat16),
+            jnp.ones((SLOTS, E, R_MAX, I_PAD), jnp.bfloat16),
             _key(layer, "up_a"):
-            jnp.ones((H_PAD, R_MAX), jnp.bfloat16),
+            jnp.ones((SLOTS, H_PAD, R_MAX), jnp.bfloat16),
             _key(layer, "up_b"):
-            jnp.ones((E, R_MAX, I_PAD), jnp.bfloat16),
+            jnp.ones((SLOTS, E, R_MAX, I_PAD), jnp.bfloat16),
             _key(layer, "down_a"):
-            jnp.ones((E, I_PAD, R_MAX), jnp.bfloat16),
+            jnp.ones((SLOTS, E, I_PAD, R_MAX), jnp.bfloat16),
             _key(layer, "down_b"):
-            jnp.ones((R_MAX, H_PAD), jnp.bfloat16),
+            jnp.ones((SLOTS, R_MAX, H_PAD), jnp.bfloat16),
             _key(layer, "scale"):
-            jnp.asarray(0., jnp.bfloat16),
+            jnp.zeros((SLOTS, ), jnp.bfloat16),
         })
     return state
 
@@ -77,17 +78,25 @@ def test_factor_update_preserves_base_and_pads_compile_time_buffers():
     state = _state()
     base_before = np.asarray(state["immutable.mxfp4.blocks"]).copy()
     factors = _factors()
-    result = set_moe_lora_factors_in_state(state, factors, {"scale": 0.5})
+    result = set_moe_lora_factors_in_state(state,
+                                            factors, {"scale": 0.5},
+                                            slot=1)
 
     assert result == {
         "layers": 2,
         "cleared": False,
         "base_weights_mutated": False,
+        "slot": 1,
+        "capacity": SLOTS,
     }
     np.testing.assert_array_equal(state["immutable.mxfp4.blocks"], base_before)
     for layer in range(2):
-        gate_a = np.asarray(state[_key(layer, "gate_a")], dtype=np.float32)
-        gate_b = np.asarray(state[_key(layer, "gate_b")], dtype=np.float32)
+        gate_a_bank = np.asarray(state[_key(layer, "gate_a")],
+                                 dtype=np.float32)
+        gate_b_bank = np.asarray(state[_key(layer, "gate_b")],
+                                 dtype=np.float32)
+        gate_a = gate_a_bank[1]
+        gate_b = gate_b_bank[1]
         expected_a = factors[f"layers.{layer}.wi_0.lora_a"]
         expected_b = factors[f"layers.{layer}.wi_0.lora_b"].transpose(1, 0, 2)
         np.testing.assert_allclose(gate_a[:H, :R],
@@ -102,29 +111,38 @@ def test_factor_update_preserves_base_and_pads_compile_time_buffers():
         assert np.count_nonzero(gate_a[:, R:]) == 0
         assert np.count_nonzero(gate_b[:, R:, :]) == 0
         assert np.count_nonzero(gate_b[:, :, I:]) == 0
-        assert float(state[_key(layer, "scale")]) == pytest.approx(0.5)
+        assert float(state[_key(layer, "scale")][1]) == pytest.approx(0.5)
+        np.testing.assert_array_equal(gate_a_bank[0], 1)
+        np.testing.assert_array_equal(gate_a_bank[2], 1)
+        np.testing.assert_array_equal(gate_b_bank[0], 1)
+        np.testing.assert_array_equal(gate_b_bank[2], 1)
 
 
 def test_new_adapter_replaces_old_values_and_clear_zeros_every_buffer():
     state = _state()
     first = _factors(1)
     second = _factors(2)
-    set_moe_lora_factors_in_state(state, first, {"scale": 1.0})
-    set_moe_lora_factors_in_state(state, second, {"scale": 0.25})
-    actual = np.asarray(state[_key(0, "down_b")], dtype=np.float32)
+    set_moe_lora_factors_in_state(state, first, {"scale": 1.0}, slot=0)
+    set_moe_lora_factors_in_state(state, second, {"scale": 0.25}, slot=1)
+    bank = np.asarray(state[_key(0, "down_b")], dtype=np.float32)
+    actual = bank[1]
     np.testing.assert_allclose(actual[:R, :H],
                                second["layers.0.wo.lora_b"],
                                rtol=1e-2,
                                atol=1e-2)
-    assert not np.allclose(
-        actual[:R, :H],
-        first["layers.0.wo.lora_b"] + second["layers.0.wo.lora_b"])
+    np.testing.assert_allclose(bank[0, :R, :H],
+                               first["layers.0.wo.lora_b"],
+                               rtol=1e-2,
+                               atol=1e-2)
 
-    result = set_moe_lora_factors_in_state(state, None, {"scale": 0.0})
+    result = set_moe_lora_factors_in_state(state,
+                                            None, {"scale": 0.0},
+                                            slot=1)
     assert result["cleared"] is True
     for key, value in state.items():
         if "tpu_moe_lora_" in key:
-            assert np.count_nonzero(np.asarray(value)) == 0
+            assert np.count_nonzero(np.asarray(value)[1]) == 0
+            assert np.count_nonzero(np.asarray(value)[0]) > 0
 
 
 def test_rank_mismatch_fails_instead_of_installing_ambiguous_factors():
@@ -133,3 +151,29 @@ def test_rank_mismatch_fails_instead_of_installing_ambiguous_factors():
     factors["layers.0.wi_0.lora_b"] = np.zeros((R + 1, E, I), dtype=np.float32)
     with pytest.raises(ValueError, match="rank mismatch"):
         set_moe_lora_factors_in_state(state, factors, {"scale": 1.0})
+
+
+def test_out_of_range_slot_is_rejected_before_any_update():
+    state = _state()
+    before = {key: np.asarray(value).copy() for key, value in state.items()}
+    with pytest.raises(ValueError, match="outside"):
+        set_moe_lora_factors_in_state(state,
+                                      _factors(), {"scale": 1.0},
+                                      slot=SLOTS)
+    for key, value in state.items():
+        np.testing.assert_array_equal(value, before[key])
+
+
+def test_oversized_late_layer_is_rejected_transactionally():
+    state = _state()
+    before = {key: np.asarray(value).copy() for key, value in state.items()}
+    factors = _factors()
+    factors["layers.1.wo.lora_b"] = np.zeros((R, H_PAD + 1),
+                                                dtype=np.float32)
+
+    with pytest.raises(ValueError, match="does not fit"):
+        set_moe_lora_factors_in_state(state,
+                                      factors, {"scale": 1.0},
+                                      slot=1)
+    for key, value in state.items():
+        np.testing.assert_array_equal(value, before[key])

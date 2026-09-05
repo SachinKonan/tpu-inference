@@ -91,8 +91,10 @@ def vllm_moe_apply(
     try:
         context = get_vllm_model_wrapper_context()
         vllm_config = context.vllm_config
+        lora_token_indices = context.lora_token_indices
     except AssertionError:
         vllm_config = None
+        lora_token_indices = None
 
     enable_return_routed_experts = vllm_config.model_config.enable_return_routed_experts if vllm_config else False
 
@@ -114,6 +116,12 @@ def vllm_moe_apply(
 
     extra_kwargs = dict(quant_method_instance.extra_backend_kwargs)
     extra_kwargs["scatter_results"] = is_dp
+    if lora_weights is not None:
+        if lora_token_indices is None:
+            raise RuntimeError(
+                "MXFP4 expert LoRA requires Punica token-slot metadata.")
+        extra_kwargs["adapter_indices"] = jax_view(
+            lora_token_indices)[:x.shape[0]]
 
     if getattr(layer, "hash_indices_table", None) is not None:
         assert input_ids is not None, "input_ids must be provided when hash_indices_table is present in the layer"
