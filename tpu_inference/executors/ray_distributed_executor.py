@@ -14,6 +14,7 @@
 
 import asyncio
 import copy
+from dataclasses import replace
 import os
 from collections import defaultdict
 from concurrent.futures import Future
@@ -486,7 +487,11 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
         refs = self.forward_dag.execute(
             (scheduler_output, grammar_output))  # type: ignore
-        return AsyncResultFuture(refs, self.workers, self.kv_output_aggregator)
+        # The DAG's outputs come from the last pipeline stage only; with PP>1
+        # zipping them against every worker would fetch result ids from the
+        # first stage, which never stored an output.
+        last_stage = self.pp_tp_workers[-1] if self.pp_tp_workers else self.workers
+        return AsyncResultFuture(refs, last_stage, self.kv_output_aggregator)
 
 
 class RayWorkerWrapper(RayWorkerWrapperV1):
@@ -541,6 +546,17 @@ class RayWorkerWrapper(RayWorkerWrapperV1):
         assert self.worker.model_runner is not None
         output = self.worker.model_runner.execute_model(
             scheduler_output, intermediate_tensors)
+        if self._is_intermediate_tensors(output):
+            # Not the last pipeline stage: hand the activations to the next
+            # stage exactly as the synchronous path does.
+            if (getattr(self.worker.model_runner, "supports_mm_inputs", False)
+                    and get_pp_group().is_first_rank):
+                scheduler_output = copy.copy(scheduler_output)
+                scheduler_output.scheduled_new_reqs = [
+                    replace(req, mm_features=[]) if hasattr(req, "mm_features") else req
+                    for req in scheduler_output.scheduled_new_reqs
+                ]
+            return scheduler_output, grammar_output, output
         assert self._is_last_rank()
         if output is None:
             output = self.worker.model_runner.sample_tokens(grammar_output)
