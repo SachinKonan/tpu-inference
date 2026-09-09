@@ -181,6 +181,15 @@ def _resolve_moe_lora_factors(factors):
     return {k: np.asarray(v, dtype=np.float32) for k, v in factors.items()}
 
 
+def _pipeline_stage_count() -> int:
+    """Pipeline-parallel world size, or 1 when the PP group is not initialized."""
+    try:
+        from tpu_inference.distributed.jax_parallel_state import get_pp_group
+        return int(get_pp_group().world_size)
+    except Exception:  # single-process paths and tests without a PP group
+        return 1
+
+
 def _moe_lora_buffer_layers(state) -> set[int]:
     """Return layers that expose the separate MXFP4 LoRA factor buffers."""
 
@@ -322,9 +331,18 @@ def set_moe_lora_factors_in_state(state, factors, meta, slot: int = 0):
     }
     unknown_layers = expert_layers - buffer_layers
     if unknown_layers:
-        raise ValueError(
-            "Expert LoRA factors target layers not present in the loaded "
-            f"model: {sorted(unknown_layers)}.")
+        # Under pipeline parallelism every stage receives the full adapter
+        # but only holds its own layers' buffers; keep the local layers and
+        # ignore the rest. Reject only when nothing matches at all.
+        if _pipeline_stage_count() > 1 and expert_layers & buffer_layers:
+            groups = {
+                key: value
+                for key, value in groups.items() if key[0] in buffer_layers
+            }
+        else:
+            raise ValueError(
+                "Expert LoRA factors target layers not present in the loaded "
+                f"model: {sorted(unknown_layers)}.")
     meta = meta or {}
     scale = float(meta.get("scale", 0.0 if resolved is None else 1.0))
 
