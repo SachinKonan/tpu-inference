@@ -115,6 +115,13 @@ class TpuPlatform(Platform):
     ]
 
     additional_env_vars: list[str] = [
+        # SkyRL: the lora_filesystem_resolver plugin loads in every Ray worker
+        # and needs its cache dir; runtime LoRA loading needs its switch.
+        # Neither is a registered vllm.envs name, so vLLM's VLLM_* copy skips
+        # them (job 540: partner-host workers died on "must be set").
+        "VLLM_LORA_RESOLVER_CACHE_DIR",
+        "VLLM_ALLOW_RUNTIME_LORA_UPDATING",
+        "VLLM_PLUGINS",
         "PHASED_PROFILING_DIR",
         "TPU_CHIPS_PER_HOST_BOUNDS",
         "TPU_HOST_BOUNDS",
