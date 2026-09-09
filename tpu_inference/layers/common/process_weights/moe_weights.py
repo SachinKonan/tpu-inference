@@ -142,6 +142,17 @@ def quantize_moe_weights(
     if (w2_bias := weights.w2_bias) is not None:
         weights.w2_bias = jnp.pad(w2_bias, w2_pad_widths[:2])
 
+    if jnp.issubdtype(dtype, jnp.floating) and jnp.dtype(dtype).itemsize >= 2:
+        # Wide float target (bf16/f16/f32): keep the dequantized weights as
+        # they are, with no block scales. Used on TPUs without an fp8 MXU
+        # (v5p), where fp8 expert tiles would otherwise be upcast inside every
+        # grouped matmul; the GMM path treats scale=None as unquantized.
+        weights.w13_weight = w13_weight.astype(dtype)
+        weights.w13_weight_scale = None
+        weights.w2_weight = w2_weight.astype(dtype)
+        weights.w2_weight_scale = None
+        return weights
+
     w13_weight, w13_weight_scale = quantize_tensor(dtype, w13_weight, 2,
                                                    w13_block_size)
     w2_weight, w2_weight_scale = quantize_tensor(dtype, w2_weight, 2,

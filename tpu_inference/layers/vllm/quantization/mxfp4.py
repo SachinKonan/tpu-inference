@@ -300,10 +300,12 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         layer.w13_weight = Parameter(weights.w13_weight, requires_grad=False)
         layer.w2_weight = Parameter(weights.w2_weight, requires_grad=False)
 
-        layer.w13_weight_scale = Parameter(weights.w13_weight_scale,
-                                           requires_grad=False)
-        layer.w2_weight_scale = Parameter(weights.w2_weight_scale,
-                                          requires_grad=False)
+        # A wide-float requantize dtype (MOE_REQUANTIZE_WEIGHT_DTYPE=bfloat16)
+        # keeps the experts unscaled; the scale attributes are then None.
+        layer.w13_weight_scale = (Parameter(weights.w13_weight_scale, requires_grad=False)
+                                  if weights.w13_weight_scale is not None else None)
+        layer.w2_weight_scale = (Parameter(weights.w2_weight_scale, requires_grad=False)
+                                 if weights.w2_weight_scale is not None else None)
 
         if has_bias:
             layer.w13_bias = Parameter(weights.w13_bias, requires_grad=False)
@@ -322,10 +324,12 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         has_bias = layer.moe_config.has_bias
         weights = FusedMoEWeights(
             w13_weight=jax_view(layer.w13_weight),
-            w13_weight_scale=jax_view(layer.w13_weight_scale),
+            w13_weight_scale=(jax_view(layer.w13_weight_scale)
+                              if layer.w13_weight_scale is not None else None),
             w13_bias=jax_view(layer.w13_bias) if has_bias else None,
             w2_weight=jax_view(layer.w2_weight),
-            w2_weight_scale=jax_view(layer.w2_weight_scale),
+            w2_weight_scale=(jax_view(layer.w2_weight_scale)
+                             if layer.w2_weight_scale is not None else None),
             w2_bias=jax_view(layer.w2_bias) if has_bias else None,
         )
 
