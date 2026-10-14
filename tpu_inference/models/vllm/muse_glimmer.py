@@ -47,6 +47,7 @@ Text only: no vision tower, projector or image/video tokens.
 from __future__ import annotations
 
 from collections.abc import Iterable
+import os
 from typing import Any
 
 import torch
@@ -366,7 +367,14 @@ class MuseGlimmerAttention(nn.Module):
         # that decoded 4/5 prompts token-for-token at 3609 tokens.
         # `kv_cache_manager` itself uses this same idiom for its
         # `disable_sliding_window` workaround.
-        self.attn.sliding_window = None
+        #
+        # SKYRL_SWA_KV=1 keeps the window on the module, so sliding layers get a
+        # `SlidingWindowSpec` and vLLM frees their blocks outside the window.
+        # Opt-in until it passes greedy parity under concurrency on the vLLM
+        # path (the reverted attempt above was the flax path at max_model_len
+        # 4096); the window only pays off when max_model_len >> sliding_window.
+        if os.environ.get("SKYRL_SWA_KV") != "1":
+            self.attn.sliding_window = None
 
     def forward(
         self,
