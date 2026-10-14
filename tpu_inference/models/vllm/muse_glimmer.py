@@ -368,12 +368,12 @@ class MuseGlimmerAttention(nn.Module):
         # `kv_cache_manager` itself uses this same idiom for its
         # `disable_sliding_window` workaround.
         #
-        # SKYRL_SWA_KV=1 keeps the window on the module, so sliding layers get a
-        # `SlidingWindowSpec` and vLLM frees their blocks outside the window.
-        # Opt-in until it passes greedy parity under concurrency on the vLLM
-        # path (the reverted attempt above was the flax path at max_model_len
-        # 4096); the window only pays off when max_model_len >> sliding_window.
-        if os.environ.get("SKYRL_SWA_KV") != "1":
+        # SKYRL_SWA_KV (default on) keeps the window on the module, so sliding
+        # layers get a `SlidingWindowSpec` and vLLM frees their blocks outside
+        # the window. It passed greedy parity on the vLLM path (sequential exact;
+        # concurrent differences within base-vs-base batch noise, v5p 2026-10-14);
+        # the reverted attempt above was the flax path. SKYRL_SWA_KV=0 turns it off.
+        if os.environ.get("SKYRL_SWA_KV", "1") == "0":
             self.attn.sliding_window = None
 
     def forward(

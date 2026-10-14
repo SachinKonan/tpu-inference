@@ -105,7 +105,7 @@ class KVCacheManager:
         # `[0, max_num_reqs]`) so it stays in-bounds for the smaller arrays.
         self._mamba_num_blocks: int | None = None
         self.actual_mamba_num_blocks: int | None = None
-        # SKYRL_SWA_KV=1: sliding-window layers get `SlidingWindowSpec` even when
+        # SKYRL_SWA_KV (default on): sliding-window layers get `SlidingWindowSpec` even when
         # attention layers have different head sizes (gemma-4: sliding hd 256,
         # global hd 512). vLLM shares one KV tensor per slot across groups, so
         # layers with different page shapes cannot share it on TPU. Upstream's
@@ -113,7 +113,9 @@ class KVCacheManager:
         # head_size, dtype), so each distinct page shape in a shared tensor gets
         # its own cache; the worker reports available HBM divided by this count so
         # vLLM's block budget still fits. 1 = every attention layer has one shape.
-        self.swa_kv = os.environ.get("SKYRL_SWA_KV") == "1"
+        # On by default (SKYRL_SWA_KV=0 turns it off for debugging); it engages only for models that have
+        # sliding-window layers (see get_kv_cache_spec), so other models keep the original path.
+        self.swa_kv = os.environ.get("SKYRL_SWA_KV", "1") != "0"
         self.attention_shape_count = 1
 
     def _create_attention_spec(
@@ -654,6 +656,9 @@ class KVCacheManager:
                 for attn_module in layers.values()
                 if not isinstance(attn_module, MambaBase)
             }
+            if not any(getattr(m, "sliding_window", None) for m in layers.values()
+                       if not isinstance(m, MambaBase)):
+                self.swa_kv = False  # no sliding layers (e.g. Qwen3.5 GDN + full attention): unchanged path
             disable_sliding_window = len(head_size_set) > 1 and not self.swa_kv
 
             logger.warning(f"Compilation num_layers = {len(layers)}")
