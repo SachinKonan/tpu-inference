@@ -567,6 +567,19 @@ class TPUWorker(WorkerBase):
                              f"{-total_hbm_avail_gb}GiB. Please consider "
                              f"increasing --gpu-memory-utilization from "
                              f"{gpu_memory_utilization} to a larger value.")
+        # SKYRL_SWA_KV with mixed page shapes allocates one tensor per shape in
+        # each shared slot (KVCacheManager.attention_shape_count), so vLLM must
+        # plan for that many times less memory per slot.
+        manager = getattr(self.model_runner, "kv_cache_manager", None)
+        if manager is not None and getattr(manager, "swa_kv", False):
+            self.get_kv_cache_spec()  # sets attention_shape_count
+            count = manager.attention_shape_count
+            if count > 1:
+                logger.info(
+                    "SKYRL_SWA_KV: %d KV page shapes share each slot; reporting "
+                    "%.2f of %.2f GiB to vLLM", count,
+                    total_hbm_avail / count / utils.GBYTES, total_hbm_avail_gb)
+                total_hbm_avail //= count
         return total_hbm_avail
 
     def execute_model(

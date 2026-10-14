@@ -105,6 +105,16 @@ class KVCacheManager:
         # `[0, max_num_reqs]`) so it stays in-bounds for the smaller arrays.
         self._mamba_num_blocks: int | None = None
         self.actual_mamba_num_blocks: int | None = None
+        # SKYRL_SWA_KV=1: sliding-window layers get `SlidingWindowSpec` even when
+        # attention layers have different head sizes (gemma-4: sliding hd 256,
+        # global hd 512). vLLM shares one KV tensor per slot across groups, so
+        # layers with different page shapes cannot share it on TPU. Upstream's
+        # `initialize_kv_cache` already keys physical slots by (num_kv_heads,
+        # head_size, dtype), so each distinct page shape in a shared tensor gets
+        # its own cache; the worker reports available HBM divided by this count so
+        # vLLM's block budget still fits. 1 = every attention layer has one shape.
+        self.swa_kv = os.environ.get("SKYRL_SWA_KV") == "1"
+        self.attention_shape_count = 1
 
     def _create_attention_spec(
             self,
@@ -644,7 +654,7 @@ class KVCacheManager:
                 for attn_module in layers.values()
                 if not isinstance(attn_module, MambaBase)
             }
-            disable_sliding_window = len(head_size_set) > 1
+            disable_sliding_window = len(head_size_set) > 1 and not self.swa_kv
 
             logger.warning(f"Compilation num_layers = {len(layers)}")
 
@@ -711,6 +721,58 @@ class KVCacheManager:
                     raise ValueError(
                         f"Unknown attention type: {attn_module.attn_type}")
 
+        if self.swa_kv:
+            kv_cache_spec = self._unify_attention_page_sizes(kv_cache_spec)
+        return kv_cache_spec
+
+    def _unify_attention_page_sizes(
+            self, kv_cache_spec: dict[str, KVCacheSpec]) -> dict[str, KVCacheSpec]:
+        """Give every attention layer the largest attention page size.
+
+        vLLM's `unify_kv_cache_spec_page_size` multiplies `block_size` but keeps
+        `page_size_padded`, which the TPU specs always set, so it cannot unify
+        them. Do it here instead: rebuild smaller-page layers with a block size
+        scaled by the page ratio (gemma-4 global layers: 16 -> 32 tokens), so
+        vLLM sees one page size and groups layers by their repeating pattern.
+        """
+        attn = {
+            name: spec
+            for name, spec in kv_cache_spec.items()
+            if type(spec) in (FullAttentionSpec, SlidingWindowSpec)
+        }
+        shapes = {(spec.block_size, spec.num_kv_heads, spec.head_size)
+                  for spec in attn.values()}
+        page_sizes = {spec.page_size_bytes for spec in attn.values()}
+        if len(page_sizes) > 1:
+            target = max(page_sizes)
+            for name, spec in attn.items():
+                if spec.page_size_bytes == target:
+                    continue
+                if target % spec.page_size_bytes:
+                    raise NotImplementedError(
+                        f"cannot unify KV page sizes {sorted(page_sizes)}")
+                block_size = spec.block_size * (target //
+                                                spec.page_size_bytes)
+                window = getattr(spec, "sliding_window", None)
+                new_spec = self._create_attention_spec(
+                    block_size,
+                    spec.num_kv_heads,
+                    spec.head_size,
+                    sliding_window=window)
+                if new_spec.page_size_bytes != target:
+                    raise NotImplementedError(
+                        f"{name}: page {new_spec.page_size_bytes} != {target} "
+                        f"at block_size {block_size}")
+                kv_cache_spec[name] = new_spec
+            shapes = {(spec.block_size, spec.num_kv_heads, spec.head_size)
+                      for name, spec in kv_cache_spec.items() if name in attn}
+        self.attention_shape_count = len(shapes)
+        logger.info(
+            "SKYRL_SWA_KV: %d sliding / %d full attention layers, %d distinct "
+            "KV page shapes %s", sum(
+                isinstance(s, SlidingWindowSpec) for s in attn.values()),
+            sum(type(s) is FullAttentionSpec for s in attn.values()),
+            len(shapes), sorted(shapes))
         return kv_cache_spec
 
     def get_kv_cache_layout(self):
