@@ -422,7 +422,10 @@ def sample(
 
 
 def compute_logprobs(logits: jax.Array) -> jax.Array:
-    return jax.nn.log_softmax(logits, axis=-1)
+    logprobs = jax.nn.log_softmax(logits, axis=-1)
+    # bf16 models can emit occasional NaN logprobs; clamp at the source so NaN never reaches the OpenAI
+    # JSON serializer ("Out of range float values are not JSON compliant: nan" 400s).
+    return jnp.nan_to_num(logprobs, nan=-1.0e4, posinf=0.0, neginf=-1.0e4)
 
 
 @jax.jit(static_argnames=["mesh", "allow_distributed_sampling"])
