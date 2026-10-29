@@ -13,6 +13,7 @@ Production serves every model through the torch path (`MODEL_IMPL_TYPE=vllm`) on
 | `42e4d796f` register Muse with vLLM + KV replication | `register_layers` plugin hook | ported; hook now runs upstream `register_models()` then ours |
 | `4f2f67942`, `b945d0054`, `afe0cb9e9` Muse torch model (LoRA), logging, qkv geometry | production Muse path | ported (clean after registration) |
 | `848263fc4` qkv width contract under LoRA | `_restore_stock_qkv_width_under_lora` | ported; `create_lora_manager(model, vllm_config)` (0.32 signature) |
+| (new) K/V LoRA on replicated-KV qkv | `_tile_replicated_kv_lora_b` in `set_lora` | **fixed on v0.32 only**: k/v lora_b tiled per replica like the base weights. On v0.23 this was a documented residual: Muse adapters (q,k,v,o,gate,up,down) at TP > 2 (2 KV heads) had misplaced K/V adapter rows |
 | `cd2228190` Muse keeps per-layer sliding windows | SlidingWindowSpec for Muse | ported (clean) |
 | `a4fb045bf` SWA KV for mixed head sizes (Gemma 4) | flag, page-size unification, HBM / shape count | ported; our per-shape tensor allocation dropped: 0.32's allocator keys slots by (heads, head_size, dtype) |
 | `6dab20e74` SWA KV on by default | default on for sliding-window models | ported (clean) |

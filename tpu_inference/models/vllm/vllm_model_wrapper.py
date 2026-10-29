@@ -17,6 +17,7 @@ import time
 from collections.abc import Sequence
 from contextlib import nullcontext
 from functools import partial
+from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple
 from unittest.mock import patch
 
@@ -779,10 +780,8 @@ def _restore_stock_qkv_width_under_lora(model: torch.nn.Module) -> int:
     replicated-KV qkv layer's output through the same collapse so LoRA
     on/off is width-identical.
 
-    (Known residual, deliberately out of scope here: adapters that target
-    k_proj/v_proj on a replicated-KV model would additionally need their
-    k/v lora_b tiled per replica in `set_lora`; the no-adapter path and
-    q/MLP-only adapters are unaffected.)
+    Adapters that target k_proj/v_proj also need their k/v lora_b tiled per
+    replica; `_tile_replicated_kv_lora_b` does that in `set_lora`.
     """
     from tpu_inference.layers.vllm.custom_ops.linear import \
         VllmQKVParallelLinear
@@ -808,6 +807,42 @@ def _restore_stock_qkv_width_under_lora(model: torch.nn.Module) -> int:
     return n
 
 
+def _tile_replicated_kv_lora_b(module: torch.nn.Module, lora_b):
+    """Tile an adapter's k/v lora_b like the base k/v weights of a replicated-KV qkv layer.
+
+    With TP > total_num_kv_heads, `VllmQKVParallelLinear` stores every KV head
+    `num_kv_head_replicas` times (h0 h0 h1 h1, `_tile_kv`), and vLLM sizes the
+    LoRA k/v output slices from that inflated head count. The adapter's k/v
+    lora_b only has the real heads, and vLLM's `set_lora` would copy it into
+    the first rows, misplacing it against the replicated base rows. Tile it the
+    same way so every replica of a head gets that head's adapter rows.
+    """
+    from tpu_inference.layers.vllm.custom_ops.linear import \
+        VllmQKVParallelLinear
+
+    base = getattr(module, "base_layer", None)
+    if not (isinstance(base, VllmQKVParallelLinear)
+            and base.num_kv_head_replicas > 1):
+        return lora_b
+    if not isinstance(lora_b, (list, tuple)) or len(lora_b) != 3:
+        raise NotImplementedError(
+            "LoRA on a replicated-KV qkv layer expects per-slice [q, k, v] "
+            f"lora_b, got {type(lora_b).__name__}"
+            f"{'' if not isinstance(lora_b, (list, tuple)) else f' of {len(lora_b)}'}")
+    rows = SimpleNamespace(output_dim=0)
+    expected = base.total_num_kv_heads * base.head_size
+    tiled = [lora_b[0]]
+    for b in lora_b[1:]:
+        if b is None:
+            tiled.append(None)
+            continue
+        if b.shape[0] != expected:
+            raise ValueError(f"k/v lora_b has {b.shape[0]} rows, expected "
+                             f"{expected} (total_num_kv_heads x head_size)")
+        tiled.append(base._tile_kv(b, rows))
+    return tiled
+
+
 # The reason why replace the method is that the set_lora and reset_lora need to
 # run under torchax env.
 def replace_set_lora(model):
@@ -818,6 +853,7 @@ def replace_set_lora(model):
         lora_a: torch.Tensor,
         lora_b: torch.Tensor,
     ):
+        lora_b = _tile_replicated_kv_lora_b(self, lora_b)
         # Use torch.no_grad() to prevent RuntimeError during leaf variable in-place updates
         with torchax.default_env(), torch.no_grad():
             self._original_set_lora(index, lora_a, lora_b)
