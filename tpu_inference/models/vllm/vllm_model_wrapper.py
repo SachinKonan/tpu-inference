@@ -763,6 +763,7 @@ def load_lora_model(model: torch.nn.Module, vllm_config: VllmConfig,
     )
     wrapped_model = lora_manager.create_lora_manager(model, vllm_config)
     _restore_stock_qkv_width_under_lora(wrapped_model)
+    _check_replicated_kv_lora_before_activation(lora_manager._adapter_manager)
     return lora_manager, wrapped_model
 
 
@@ -841,6 +842,45 @@ def _tile_replicated_kv_lora_b(module: torch.nn.Module, lora_b):
                              f"{expected} (total_num_kv_heads x head_size)")
         tiled.append(base._tile_kv(b, rows))
     return tiled
+
+
+def _check_replicated_kv_lora_before_activation(adapter_manager) -> None:
+    """Refuse an adapter whose k/v lora_b cannot be tiled before vLLM activates it.
+
+    vLLM's `activate_adapter` marks the adapter active and takes its slot before
+    calling `set_lora` on each module, so an error from `set_lora` would leave
+    it half-loaded and a retry would report it as already active. Run every
+    `_tile_replicated_kv_lora_b` check first, while nothing has changed; the
+    adapter then stays inactive and every retry fails the same way.
+    """
+    from tpu_inference.layers.vllm.custom_ops.linear import \
+        VllmQKVParallelLinear
+
+    replicated = {
+        name: module
+        for name, module in adapter_manager.modules.items()
+        if isinstance(getattr(module, "base_layer", None),
+                      VllmQKVParallelLinear)
+        and module.base_layer.num_kv_head_replicas > 1
+    }
+    if not replicated:
+        return
+    activate = adapter_manager.activate_adapter
+
+    def activate_adapter(lora_id: int) -> bool:
+        if lora_id not in adapter_manager._active_adapters:
+            lora_model = adapter_manager._registered_adapters[lora_id]
+            for name, module in replicated.items():
+                weights = adapter_manager._get_lora_layer_weights(
+                    lora_model, name)
+                if weights is not None:
+                    _tile_replicated_kv_lora_b(module, weights.lora_b)
+        return activate(lora_id)
+
+    adapter_manager.activate_adapter = activate_adapter
+    logger.info(
+        "Replicated-KV LoRA: %d qkv layers; adapters are checked before "
+        "activation.", len(replicated))
 
 
 # The reason why replace the method is that the set_lora and reset_lora need to
