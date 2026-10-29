@@ -75,6 +75,8 @@ from tpu_inference.runner import utils as runner_utils
 from tpu_inference.runner.compilation_manager import CompilationManager
 from tpu_inference.runner.decode_loop import TpuSamplingState, continue_decode
 from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
+from tpu_inference.runner.thinking_budget import BudgetRunner, validate_backend
+from tpu_inference.layers.jax.sample.sampling import sample_with_budget
 from tpu_inference.runner.kv_cache_manager import KVCacheManager
 from tpu_inference.runner.lora_utils import LoraUtils
 from tpu_inference.runner.multimodal_manager import MultiModalManager
@@ -789,6 +791,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         is_last_rank: bool = True,
     ):
         self.vllm_config = vllm_config
+        import os
+        self._thinking_budget_runner = (
+            BudgetRunner() if os.environ.get("SKYRL_TPU_THINKING_BUDGET") == "1" else None)
+        self._thinking_benchmark_pending = os.environ.get("SKYRL_THINKING_BUDGET_BENCHMARK") == "1"
         # The KV cache layout of the TPU attention backend --attention-backend
         # selects.
         self.attention_backend = create_attention_backend(
@@ -1648,6 +1654,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
     ) -> JaxIntermediateTensors | ModelRunnerOutput | None:
         self.persistent_batch_manager.update_states(
             scheduler_output, self.get_mrope_input_positions_fn)
+        if self._thinking_budget_runner is not None:
+            validate_backend(self)
         if self.aux_output_worker is not None:
             self.aux_output_worker.begin_step(
                 scheduler_output.aux_output_connector_metadata)
@@ -2108,14 +2116,30 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             tpu_sampling_metadata.logprobs, self.model_config.logprobs_mode)
         if spec_decode_metadata is None:
             logits = logits.astype(jnp.float32)
+            control = self._thinking_budget_runner
+            prepared = (control.prepare(self, scheduler_output, logits.shape[0], req_ids_dp)
+                        if control is not None else None)
+            if prepared is not None and self._thinking_benchmark_pending:
+                # Diagnostic only: identical logits/RNG, discarded immutable
+                # outputs. Never enabled by the normal opt-in serving wrapper.
+                from tpu_inference.runner.thinking_budget_device import benchmark_sampler
+                benchmark_sampler(sample, sample_with_budget, step_rng, self.mesh,
+                                  logits, tpu_sampling_metadata, prepared)
+                self._thinking_benchmark_pending = False
             with self.maybe_forbid_compile:
-                next_tokens, processed_logits = sample(
-                    step_rng,
-                    self.mesh,
-                    logits,
-                    tpu_sampling_metadata,
-                    allow_distributed_sampling=allow_distributed_sampling,
-                )
+                if prepared is None:
+                    next_tokens, processed_logits = sample(
+                        step_rng,
+                        self.mesh,
+                        logits,
+                        tpu_sampling_metadata,
+                        allow_distributed_sampling=allow_distributed_sampling,
+                    )
+                else:
+                    next_tokens, processed_logits, bank = sample_with_budget(
+                        step_rng, self.mesh, logits, tpu_sampling_metadata, *prepared,
+                        allow_distributed_sampling=allow_distributed_sampling)
+                    control.commit(bank)
         else:
             if tpu_sampling_metadata.do_sampling:
                 bonus_rng, rejection_rng = jax.random.split(step_rng)

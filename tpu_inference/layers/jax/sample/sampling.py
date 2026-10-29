@@ -425,6 +425,18 @@ def compute_logprobs(logits: jax.Array) -> jax.Array:
     return jax.nn.log_softmax(logits, axis=-1)
 
 
+@jax.jit(static_argnames=["mesh", "allow_distributed_sampling"])
+def sample_with_budget(rng, mesh, logits, metadata, bank, slots, valid, detector=None,
+                       allow_distributed_sampling=True):
+    from tpu_inference.runner.thinking_budget_device import device_step
+
+    tokens, processed = sample(rng, mesh, logits, metadata,
+                               allow_distributed_sampling=allow_distributed_sampling)
+    tokens, bank = device_step(tokens, bank, slots, valid, detector)
+    tokens = jax.lax.with_sharding_constraint(tokens, NamedSharding(mesh, P()))
+    return tokens, processed, bank
+
+
 # Replicate outputs via out_shardings=P() so multi-host device_get() succeeds
 # under DP attention (ATTN_DATA). Callers must run under jax.set_mesh().
 @jax.jit(static_argnames=("max_logprobs", ), out_shardings=P())
