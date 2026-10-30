@@ -428,13 +428,18 @@ def compute_logprobs(logits: jax.Array) -> jax.Array:
     return jnp.nan_to_num(logprobs, nan=-1.0e4, posinf=0.0, neginf=-1.0e4)
 
 
-@jax.jit(static_argnames=["mesh", "allow_distributed_sampling"])
+# `sample` sets compiler_options, which JAX only accepts on a top-level jit: carry the same options here
+# and trace sample's body (sample.__wrapped__) inline instead of calling the nested jit.
+@jax.jit(
+    static_argnames=["mesh", "allow_distributed_sampling"],
+    compiler_options=get_sampling_compiler_options(),
+)
 def sample_with_budget(rng, mesh, logits, metadata, bank, slots, valid, detector=None,
                        allow_distributed_sampling=True):
     from tpu_inference.runner.thinking_budget_device import device_step
 
-    tokens, processed = sample(rng, mesh, logits, metadata,
-                               allow_distributed_sampling=allow_distributed_sampling)
+    tokens, processed = sample.__wrapped__(rng, mesh, logits, metadata,
+                                           allow_distributed_sampling=allow_distributed_sampling)
     tokens, bank = device_step(tokens, bank, slots, valid, detector)
     tokens = jax.lax.with_sharding_constraint(tokens, NamedSharding(mesh, P()))
     return tokens, processed, bank
