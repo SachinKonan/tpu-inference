@@ -1000,9 +1000,11 @@ class TestTPUJaxRunnerDPInputsLightweight:
         """Crash dump, Gemma 4 on v6e-8: a cached request (not in
         resumed_req_ids) recomputes 900 tokens from 10002 computed, past its
         prompt, while still in the previous step's placeholder map."""
-        prompt = 9351
-        self.runner.input_batch.num_prompt_tokens = np.array(
-            [10, prompt, 5, 15])
+        self.runner.input_batch.num_prompt_tokens = np.array([10, 9351, 5, 15])
+        self.runner.input_batch.num_computed_tokens_cpu = np.array(
+            [10, 10002, 5, 15])
+        self.runner.input_batch.num_tokens_no_spec = np.array(
+            [11, 10903, 6, 16])
         req_ids_dp = {0: ["req1", "req2"]}
         scheduled_tokens_per_dp_rank = {0: [1, 900]}
         self.runner._pre_async_results = MagicMock()
@@ -1010,26 +1012,28 @@ class TestTPUJaxRunnerDPInputsLightweight:
             "req1": 0,
             "req2": 1
         }
-
-        # Recompute ends at a known token (10902), before the in-flight
-        # placeholder at 10903: no substitution, and no assertion.
-        self.runner.input_batch.num_computed_tokens_cpu = np.array(
-            [10, 10002, 5, 15])
-        self.runner.input_batch.num_tokens_no_spec = np.array(
-            [11, 10903, 6, 16])
         cur, pre = self.runner._prepare_async_token_substitution_indices(
             req_ids_dp, scheduled_tokens_per_dp_rank, 1024, 1)
         assert cur[0] == [0]
         assert pre[0] == [0]
 
-        # Recompute running up to the in-flight token: substitute its last
-        # position (1 + 900 - 1).
+    def test_prepare_async_token_substitution_continue_decode(self):
+        """Continue-decode runs _modify_prev_results first, so computed ==
+        num_tokens_no_spec; a one-token decode must still be substituted."""
         self.runner.input_batch.num_computed_tokens_cpu = np.array(
-            [10, 10003, 5, 15])
+            [11, 21, 6, 16])
+        self.runner.input_batch.num_tokens_no_spec = np.array([11, 21, 6, 16])
+        req_ids_dp = {0: ["req1", "req2"]}
+        scheduled_tokens_per_dp_rank = {0: [1, 1]}
+        self.runner._pre_async_results = MagicMock()
+        self.runner._pre_async_results.placeholder_req_id_to_index = {
+            "req1": 3,
+            "req2": 5
+        }
         cur, pre = self.runner._prepare_async_token_substitution_indices(
             req_ids_dp, scheduled_tokens_per_dp_rank, 1024, 1)
-        assert cur[0] == [0, 900]
-        assert pre[0] == [0, 1]
+        assert cur[0] == [0, 1]
+        assert pre[0] == [3, 5]
 
     def test_prepare_async_token_substitution_skips_resumed_requests(self):
         """A request resumed from preemption this step has no in-flight token:
