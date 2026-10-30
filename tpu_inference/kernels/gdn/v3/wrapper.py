@@ -22,6 +22,10 @@ from jax.experimental.pallas import tpu as pltpu
 from tpu_inference.kernels.gdn.v3 import (compute_conv1d, compute_gdn, config,
                                           memory_ref, metadata, vmem_ldst)
 
+# Chips with at most this much VMEM (TPU v4) use a smaller prefill/mixed tile.
+_SMALL_VMEM_BYTES = 16 * 1024 * 1024
+_SMALL_VMEM_MIXED_TILE = 32
+
 
 def inner_kernel(
     # Inputs.
@@ -394,6 +398,11 @@ def fused_conv1d_gdn(
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
     decode_tile_size = min(decode_tile_size, batch_size)
     mixed_tile_size = min(mixed_tile_size, batch_size)
+    if pltpu.get_tpu_info().vmem_capacity_bytes <= _SMALL_VMEM_BYTES:
+        # TPU v4 (16 MiB VMEM): the 64-token mixed tile needs 11.43M of scoped
+        # VMEM for Qwen3.5-27B at TP4 (12 local v-heads) against an 11.2M limit
+        # (CompileTimeScopedVmemOom). The per-tile scratch scales with the tile.
+        mixed_tile_size = min(mixed_tile_size, _SMALL_VMEM_MIXED_TILE)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
 
     if num_spec_tokens > 0:
