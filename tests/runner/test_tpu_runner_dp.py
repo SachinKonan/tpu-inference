@@ -994,6 +994,34 @@ class TestTPUJaxRunnerDPInputsLightweight:
         assert token_in_tpu_cur_input_indices_dp[1] == []
         assert token_in_tpu_pre_next_tokens_indices_dp[1] == []
 
+    def test_prepare_async_token_substitution_skips_resumed_requests(self):
+        """A request preempted and resumed with a prefix-cache hit past its
+        prompt recomputes many known tokens: no substitution, no assert."""
+        # req1 decodes normally; req2 was resumed this step: computed (25)
+        # exceeds its prompt (20) and it schedules 900 tokens.
+        self.runner.input_batch.num_computed_tokens_cpu = np.array(
+            [10, 25, 5, 15])
+        req_ids_dp = {0: ["req1", "req2"]}
+        scheduled_tokens_per_dp_rank = {0: [1, 900]}
+        self.runner._pre_async_results = MagicMock()
+        self.runner._pre_async_results.placeholder_req_id_to_index = {
+            "req1": 0,
+            "req2": 1
+        }
+
+        with pytest.raises(AssertionError, match="but got 900"):
+            self.runner._prepare_async_token_substitution_indices(
+                req_ids_dp, scheduled_tokens_per_dp_rank, 1024, 1)
+
+        cur, pre = self.runner._prepare_async_token_substitution_indices(
+            req_ids_dp,
+            scheduled_tokens_per_dp_rank,
+            1024,
+            1,
+            resumed_req_ids={"req2"})
+        assert cur[0] == [0]
+        assert pre[0] == [0]
+
     def test_apply_async_token_substitution_empty_indices(self):
         """Test _apply_async_token_substitution with empty indices (line 1025)."""
 
