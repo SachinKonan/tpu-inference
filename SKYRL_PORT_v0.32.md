@@ -24,7 +24,8 @@ Production serves every model through the torch path (`MODEL_IMPL_TYPE=vllm`) on
 `b7ff9dc7e` pieces:
 - `USE_JAX_RAGGED_CONV1D` (v4 Qwen: the old Pallas conv1d failed on v4): not ported. 0.32 replaced the separate
   conv1d call with a fused conv1d + GDN kernel (`kernels.gdn.v3`, `GDNLinearAttentionBackend`); the knob has no
-  call site. Whether the fused kernel runs on v4 is checked on the v4 test farm (bundle v46).
+  call site. On v4 the fused kernel's 64-token prefill/mixed tile overran scoped VMEM (11.43M vs 11.2M,
+  CompileTimeScopedVmemOom, bundle v46); chips with <= 16 MiB VMEM now use a 32-token mixed tile (`0b45efb76`).
 - RPA v3 default block sizes have no `tpu_version=4` case on 0.32: ported (`966498714`). Without it the v4 AOT
   lower failed, and the warmup fallback then died on LoRA metadata leaked by the failed trace; `step_fun_impl`
   now restores LoRA metadata in a `finally` (`f75c0eb7f`).
