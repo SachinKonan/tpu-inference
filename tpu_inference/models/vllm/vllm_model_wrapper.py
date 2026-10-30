@@ -389,21 +389,27 @@ class VllmModelWrapper:
                 # torch_view in order to call the Torch function.
                 original_lora_metadata = replace_lora_metadata(
                     self.model, lora_metadata, self.vllm_config.lora_config)
-                if not is_first_rank:
-                    intermediate_tensors = intermediate_tensors.to_torch()
-                output_from_torch = torch.func.functional_call(
-                    self.model,
-                    torch_view(params_and_buffers),
-                    kwargs={
-                        "input_ids": torch_view(input_ids),
-                        "positions": torch_view(input_positions),
-                        "intermediate_tensors": intermediate_tensors,
-                        "inputs_embeds": torch_view(input_embeds),
-                    },
-                    tie_weights=False,
-                )
-                replace_lora_metadata(self.model, original_lora_metadata,
-                                      self.vllm_config.lora_config)
+                # Restore even when tracing fails (e.g. an AOT lower the
+                # compilation manager falls back from): otherwise the LoRA
+                # metadata keeps leaked tracers and the warmup pass dies with
+                # UnexpectedTracerError.
+                try:
+                    if not is_first_rank:
+                        intermediate_tensors = intermediate_tensors.to_torch()
+                    output_from_torch = torch.func.functional_call(
+                        self.model,
+                        torch_view(params_and_buffers),
+                        kwargs={
+                            "input_ids": torch_view(input_ids),
+                            "positions": torch_view(input_positions),
+                            "intermediate_tensors": intermediate_tensors,
+                            "inputs_embeds": torch_view(input_embeds),
+                        },
+                        tie_weights=False,
+                    )
+                finally:
+                    replace_lora_metadata(self.model, original_lora_metadata,
+                                          self.vllm_config.lora_config)
                 vllm_model_wrapper_context = get_vllm_model_wrapper_context()
                 new_kv_caches = vllm_model_wrapper_context.kv_caches
 
