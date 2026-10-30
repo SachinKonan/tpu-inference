@@ -56,6 +56,8 @@ class TestTPUJaxRunnerDPInputsLightweight:
         self.runner.input_batch.num_computed_tokens_cpu = np.array(
             [10, 20, 5, 15])
         self.runner.input_batch.num_prompt_tokens = np.array([10, 20, 5, 15])
+        # One sampled (placeholder) token past the computed ones.
+        self.runner.input_batch.num_tokens_no_spec = np.array([11, 21, 6, 16])
         self.runner.input_batch.token_ids_cpu = np.random.randint(
             0, 1000, (8, 64), dtype=np.int32)
 
@@ -994,13 +996,13 @@ class TestTPUJaxRunnerDPInputsLightweight:
         assert token_in_tpu_cur_input_indices_dp[1] == []
         assert token_in_tpu_pre_next_tokens_indices_dp[1] == []
 
-    def test_prepare_async_token_substitution_skips_resumed_requests(self):
-        """A request preempted and resumed with a prefix-cache hit past its
-        prompt recomputes many known tokens: no substitution, no assert."""
-        # req1 decodes normally; req2 was resumed this step: computed (25)
-        # exceeds its prompt (20) and it schedules 900 tokens.
-        self.runner.input_batch.num_computed_tokens_cpu = np.array(
-            [10, 25, 5, 15])
+    def test_prepare_async_token_substitution_recompute_after_preemption(self):
+        """Crash dump, Gemma 4 on v6e-8: a cached request (not in
+        resumed_req_ids) recomputes 900 tokens from 10002 computed, past its
+        prompt, while still in the previous step's placeholder map."""
+        prompt = 9351
+        self.runner.input_batch.num_prompt_tokens = np.array(
+            [10, prompt, 5, 15])
         req_ids_dp = {0: ["req1", "req2"]}
         scheduled_tokens_per_dp_rank = {0: [1, 900]}
         self.runner._pre_async_results = MagicMock()
@@ -1009,10 +1011,41 @@ class TestTPUJaxRunnerDPInputsLightweight:
             "req2": 1
         }
 
-        with pytest.raises(AssertionError, match="but got 900"):
-            self.runner._prepare_async_token_substitution_indices(
-                req_ids_dp, scheduled_tokens_per_dp_rank, 1024, 1)
+        # Recompute ends at a known token (10902), before the in-flight
+        # placeholder at 10903: no substitution, and no assertion.
+        self.runner.input_batch.num_computed_tokens_cpu = np.array(
+            [10, 10002, 5, 15])
+        self.runner.input_batch.num_tokens_no_spec = np.array(
+            [11, 10903, 6, 16])
+        cur, pre = self.runner._prepare_async_token_substitution_indices(
+            req_ids_dp, scheduled_tokens_per_dp_rank, 1024, 1)
+        assert cur[0] == [0]
+        assert pre[0] == [0]
 
+        # Recompute running up to the in-flight token: substitute its last
+        # position (1 + 900 - 1).
+        self.runner.input_batch.num_computed_tokens_cpu = np.array(
+            [10, 10003, 5, 15])
+        cur, pre = self.runner._prepare_async_token_substitution_indices(
+            req_ids_dp, scheduled_tokens_per_dp_rank, 1024, 1)
+        assert cur[0] == [0, 900]
+        assert pre[0] == [0, 1]
+
+    def test_prepare_async_token_substitution_skips_resumed_requests(self):
+        """A request resumed from preemption this step has no in-flight token:
+        its placeholder was reset and marked stale by the scheduler."""
+        self.runner.input_batch.num_computed_tokens_cpu = np.array(
+            [10, 20, 5, 15])
+        req_ids_dp = {0: ["req1", "req2"]}
+        scheduled_tokens_per_dp_rank = {0: [1, 1]}
+        self.runner._pre_async_results = MagicMock()
+        self.runner._pre_async_results.placeholder_req_id_to_index = {
+            "req1": 0,
+            "req2": 1
+        }
+        cur, _ = self.runner._prepare_async_token_substitution_indices(
+            req_ids_dp, scheduled_tokens_per_dp_rank, 1024, 1)
+        assert cur[0] == [0, 1]
         cur, pre = self.runner._prepare_async_token_substitution_indices(
             req_ids_dp,
             scheduled_tokens_per_dp_rank,
@@ -1275,6 +1308,8 @@ class TestTPUJaxRunnerDPInputsLightweight:
         self.runner.input_batch.num_reqs = 2
         self.runner.input_batch.req_ids = ["req1", "req2"]
         self.runner.input_batch.num_computed_tokens_cpu = np.array([4, 6])
+        # Decoding: the previous step's sampled token is one past computed.
+        self.runner.input_batch.num_tokens_no_spec = np.array([5, 7])
         self.runner.input_batch.num_prompt_tokens = np.array(
             [4, 6])  # Make them decode (not prefill)
         self.runner.input_batch.token_ids_cpu = np.zeros((8, 64),
