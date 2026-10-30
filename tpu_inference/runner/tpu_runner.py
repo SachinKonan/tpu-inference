@@ -2631,7 +2631,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
     def _prepare_async_token_substitution_indices(
             self, req_ids_dp, scheduled_tokens_per_dp_rank,
-            padded_num_scheduled_tokens_per_dp_rank, dp_size):
+            padded_num_scheduled_tokens_per_dp_rank, dp_size,
+            resumed_req_ids=frozenset()):
         """Prepare token substitution indices for async scheduling."""
         # For input_ids substitution.
         token_in_tpu_cur_input_indices_dp = {}
@@ -2667,6 +2668,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 # for a resumed prefill request.
                 if is_prefill:
                     # Skip substitution for prefill requests (including chunked prefill)
+                    continue
+
+                # A request resumed from preemption this step recomputes only
+                # known tokens: the scheduler reset its output placeholders and
+                # marked the in-flight token stale. With prefix caching its
+                # computed tokens can already exceed the prompt (so is_prefill
+                # is False) while it schedules hundreds of tokens; substituting
+                # the stale sampled token would corrupt its last input and the
+                # one-token assert below would kill the engine.
+                if req_id in resumed_req_ids:
                     continue
 
                 if req_id not in self._pre_async_results.placeholder_req_id_to_index:
@@ -2837,7 +2848,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 token_in_tpu_pre_next_tokens_indices_dp,
             ) = self._prepare_async_token_substitution_indices(
                 req_ids_dp, scheduled_tokens_per_dp_rank,
-                padded_num_scheduled_tokens_per_dp_rank, dp_size)
+                padded_num_scheduled_tokens_per_dp_rank, dp_size,
+                resumed_req_ids=getattr(scheduler_output.scheduled_cached_reqs,
+                                        "resumed_req_ids", None) or frozenset())
 
         self.device_buffer.reset()
 
