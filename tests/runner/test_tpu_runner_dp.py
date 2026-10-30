@@ -1017,6 +1017,26 @@ class TestTPUJaxRunnerDPInputsLightweight:
         assert cur[0] == [0]
         assert pre[0] == [0]
 
+    def test_prepare_async_token_substitution_one_token_recompute(self):
+        """The scheduler budget can cap a recompute at one token: same state
+        as the crash dump, one token scheduled, still a known input."""
+        self.runner.input_batch.num_prompt_tokens = np.array([10, 9351, 5, 15])
+        self.runner.input_batch.num_computed_tokens_cpu = np.array(
+            [10, 10002, 5, 15])
+        self.runner.input_batch.num_tokens_no_spec = np.array(
+            [11, 10903, 6, 16])
+        req_ids_dp = {0: ["req1", "req2"]}
+        scheduled_tokens_per_dp_rank = {0: [1, 1]}
+        self.runner._pre_async_results = MagicMock()
+        self.runner._pre_async_results.placeholder_req_id_to_index = {
+            "req1": 0,
+            "req2": 1
+        }
+        cur, pre = self.runner._prepare_async_token_substitution_indices(
+            req_ids_dp, scheduled_tokens_per_dp_rank, 1024, 1)
+        assert cur[0] == [0]
+        assert pre[0] == [0]
+
     def test_prepare_async_token_substitution_continue_decode(self):
         """Continue-decode runs _modify_prev_results first, so computed ==
         num_tokens_no_spec; a one-token decode must still be substituted."""
