@@ -2684,10 +2684,19 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     continue
 
                 if not spec_decode_enabled:
-                    # Treat as normal decode: substitute 1 token
-                    assert num_scheduled_tokens_per_req[i] == 1, (
-                        f"Expected 1 token for normal decode request {req_id}, "
-                        f"but got {num_scheduled_tokens_per_req[i]}")
+                    # The previous step's sampled token sits at position
+                    # num_tokens_no_spec - 1 (_update_placeholder). Substitute
+                    # only if this step's last scheduled token is that position.
+                    # A recompute after preemption can schedule many tokens
+                    # while computed tokens already exceed the prompt (so
+                    # is_prefill is False) and end at a known token (Gemma 4 on
+                    # v6e-8: 900 tokens from 10002), with resumed_req_ids empty.
+                    last_pos = (int(self.input_batch.
+                                    num_computed_tokens_cpu[req_idx]) +
+                                int(num_scheduled_tokens_per_req[i]))
+                    if last_pos != int(
+                            self.input_batch.num_tokens_no_spec[req_idx]):
+                        continue
                     token_in_tpu_cur_input_indices_list.append(acc_cur_len - 1)
                     token_in_tpu_pre_next_tokens_indices_list.append(
                         self._pre_async_results.
