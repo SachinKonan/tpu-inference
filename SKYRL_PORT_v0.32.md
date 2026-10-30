@@ -7,7 +7,7 @@ Production serves every model through the torch path (`MODEL_IMPL_TYPE=vllm`) on
 |---|---|---|
 | `a77620929` dynamic LoRA adapter management (#2707) | worker add/remove/list/pin_lora | upstream (in 0.32.0) |
 | `0ae6bf7aa` NaN logprob clamp | `compute_logprobs` nan_to_num | ported (`1fdf87d69`) |
-| runner.patch + thinking_budget*.py (SkyRL repo assets) | native thinking-token budget | ported (`4ecb7654b`); `allow_distributed_sampling` passed through |
+| runner.patch + thinking_budget*.py (SkyRL repo assets) | native thinking-token budget | ported (`4ecb7654b`); `allow_distributed_sampling` passed through. Fix (`498722a9f`): 0.32's `sample` carries compiler_options, illegal on a nested jit; `sample_with_budget` carries them and inlines `sample.__wrapped__` (crashed every capped request on the v6e test farm) |
 | `9b1a12a34`, `73decaf4f` Muse JAX core + JAX serving model | Muse flax path | ported (clean) |
 | `f02489100` Muse registry wiring | `_MODEL_TYPE_REGISTRY` fallback | ported; kept upstream DFlash registrations |
 | `42e4d796f` register Muse with vLLM + KV replication | `register_layers` plugin hook | ported; hook now runs upstream `register_models()` then ours |
@@ -24,7 +24,10 @@ Production serves every model through the torch path (`MODEL_IMPL_TYPE=vllm`) on
 `b7ff9dc7e` pieces:
 - `USE_JAX_RAGGED_CONV1D` (v4 Qwen: the old Pallas conv1d failed on v4): not ported. 0.32 replaced the separate
   conv1d call with a fused conv1d + GDN kernel (`kernels.gdn.v3`, `GDNLinearAttentionBackend`); the knob has no
-  call site. Whether the fused kernel runs on v4 is checked on the v4 test farm before deciding on a v4 fallback.
+  call site. Whether the fused kernel runs on v4 is checked on the v4 test farm (bundle v46).
+- RPA v3 default block sizes have no `tpu_version=4` case on 0.32: ported (`966498714`). Without it the v4 AOT
+  lower failed, and the warmup fallback then died on LoRA metadata leaked by the failed trace; `step_fun_impl`
+  now restores LoRA metadata in a `finally` (`f75c0eb7f`).
 - batched RPA bkv_sz / VMEM-fit fixes (Muse uses `USE_BATCHED_RPA_KERNEL`): pending a Muse v0.32 farm test.
 - `CUSTOM_NUM_TOKENS_BUCKETS`, `SERIALIZE_MODEL_AND_SAMPLING`: not ported, no profile sets them.
 - Gemma 4 `quantize_kv` layout workaround: not ported, it is in the JAX Gemma model; Gemma serves via the torch path.
