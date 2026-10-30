@@ -14,6 +14,7 @@
 
 import dataclasses
 import enum
+import os
 from typing import Any
 
 import jax
@@ -144,6 +145,10 @@ class GDNConfig:
         tpu_info = pltpu.get_tpu_info()
         fraction = (self.WINDOWED_VMEM_FRACTION
                     if self.window_size > 1 else self.DEFAULT_VMEM_FRACTION)
+        # Bisection knob for TPU v4; unset keeps the fractions above.
+        override = os.environ.get("SKYRL_GDN_VMEM_FRACTION")
+        if override:
+            fraction = max(fraction, float(override))
         return int(fraction * tpu_info.vmem_capacity_bytes)
 
     def get_scratch_shape_dict(self) -> dict[str, Any]:

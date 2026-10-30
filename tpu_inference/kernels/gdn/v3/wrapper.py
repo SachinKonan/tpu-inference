@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -403,6 +404,16 @@ def fused_conv1d_gdn(
         # VMEM for Qwen3.5-27B at TP4 (12 local v-heads) against an 11.2M limit
         # (CompileTimeScopedVmemOom). The per-tile scratch scales with the tile.
         mixed_tile_size = min(mixed_tile_size, _SMALL_VMEM_MIXED_TILE)
+    # Bisection knobs for TPU v4; unset keeps the values above.
+    if os.environ.get("SKYRL_GDN_MIXED_TILE"):
+        mixed_tile_size = min(int(os.environ["SKYRL_GDN_MIXED_TILE"]),
+                              batch_size)
+    if os.environ.get("SKYRL_GDN_DECODE_TILE"):
+        decode_tile_size = min(int(os.environ["SKYRL_GDN_DECODE_TILE"]),
+                               batch_size)
+    tuned_buffers = {}
+    if os.environ.get("SKYRL_GDN_NUM_BUFFERS"):
+        tuned_buffers["num_buffers"] = int(os.environ["SKYRL_GDN_NUM_BUFFERS"])
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
 
     if num_spec_tokens > 0:
@@ -483,6 +494,7 @@ def fused_conv1d_gdn(
             num_v_heads=n_v,
             kq_head_dim=d_k,
             v_head_dim=d_v,
+            **tuned_buffers,
             dtypes=config.Dtypes(
                 act_in=act_in_dtype,
                 act_out=act_out_dtype,
