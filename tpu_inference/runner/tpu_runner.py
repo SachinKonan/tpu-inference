@@ -2684,15 +2684,22 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     continue
 
                 if not spec_decode_enabled:
-                    # Non-spec decode schedules exactly one token. More than
-                    # one means a recompute after preemption: partial prefill
-                    # chunks never get a placeholder, and preemption drops the
-                    # in-flight token, so its scheduled tokens are all known
-                    # and nothing is substituted. With prefix caching such a
-                    # request can already be past its prompt (is_prefill False)
-                    # with resumed_req_ids empty, as in the Gemma 4 v6e-8 crash
-                    # (900 tokens from 10002 computed).
-                    if num_scheduled_tokens_per_req[i] != 1:
+                    # The previous step's sampled token sits at position
+                    # num_tokens_no_spec - 1 (_update_placeholder); a decode
+                    # schedules exactly that one token. Continue-decode has
+                    # already advanced computed to num_tokens_no_spec in
+                    # _modify_prev_results, so its one token lands one past it.
+                    # Anything ending before the placeholder is a recompute
+                    # after preemption of known tokens (preemption drops the
+                    # in-flight token; partial chunks get no placeholder), even
+                    # past the prompt with resumed_req_ids empty, as in the
+                    # Gemma 4 v6e-8 crash (900 tokens from 10002 computed), and
+                    # even when the scheduler budget caps it at one token.
+                    num_scheduled = int(num_scheduled_tokens_per_req[i])
+                    last_pos = int(self.input_batch.
+                                   num_computed_tokens_cpu[req_idx]) + num_scheduled
+                    if (num_scheduled != 1 or last_pos < int(
+                            self.input_batch.num_tokens_no_spec[req_idx])):
                         continue
                     token_in_tpu_cur_input_indices_list.append(acc_cur_len - 1)
                     token_in_tpu_pre_next_tokens_indices_list.append(
