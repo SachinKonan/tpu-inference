@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import os
 import logging
 import random
 import sys
@@ -512,6 +513,35 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         return self._model_runner_output
 
 
+
+def _skyrl_install_async_debug(runner):
+    """SKYRL_DEBUG_ASYNC=1: log both sides' counters when a delivered token has no placeholder."""
+    from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+    original = AsyncScheduler._update_request_with_output
+
+    def wrapped(self, request, new_token_ids, is_stale=False):
+        if not is_stale and request.num_output_placeholders < len(new_token_ids):
+            state = runner.requests.get(request.request_id)
+            index = runner.input_batch.req_id_to_index.get(request.request_id)
+            logger.error(
+                "SKYRL_DEBUG_ASYNC req=%s status=%s sched: prompt=%s output=%s tokens=%s computed=%s "
+                "placeholders=%s in_flight=%s stale=%s preemptions=%s chunk=%s new=%s | runner: "
+                "state_tokens=%s state_computed=%s state_output=%s tail=%s index=%s batch_computed=%s "
+                "batch_tokens=%s",
+                request.request_id, request.status, request.num_prompt_tokens,
+                request.num_output_tokens, request.num_tokens, request.num_computed_tokens,
+                request.num_output_placeholders, request.num_in_flight_tokens,
+                request.num_stale_output_tokens, request.num_preemptions, request.is_prefill_chunk,
+                new_token_ids,
+                state.num_tokens if state else None, state.num_computed_tokens if state else None,
+                len(state.output_token_ids) if state else None,
+                list(state.output_token_ids[-4:]) if state else None, index,
+                None if index is None else int(runner.input_batch.num_computed_tokens_cpu[index]),
+                None if index is None else int(runner.input_batch.num_tokens[index]))
+        return original(self, request, new_token_ids, is_stale)
+
+    AsyncScheduler._update_request_with_output = wrapped
+
 @dataclass
 class AsyncPreResults:
     req_ids: list[str]
@@ -860,6 +890,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         """Generative model or pooling model select different computations."""
         self.enable_continue_decode = self.vllm_config.additional_config.get(
             "enable_continue_decode", False)
+        if os.environ.get("SKYRL_DEBUG_ASYNC"):
+            _skyrl_install_async_debug(self)
         # continue_decode EOS-check interval: how often the fused decode loop
         # observes the any-sequence-hit-EOS early exit (see decode_loop.py). Set
         # via the CONTINUE_DECODE_EOS_CHECK_INTERVAL env var so it can be retuned
