@@ -21,7 +21,6 @@ another pair under a name.
 """
 
 import abc
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -31,9 +30,6 @@ from vllm.ray.lazy_utils import is_in_ray_actor
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from tpu_inference import envs
-from tpu_inference.logger import init_logger
-
-logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     import jax
@@ -128,44 +124,12 @@ class LinearAttentionBackend(abc.ABC):
         """The fused conv1d + GDN kernel run_jax_gdn_attention shard-maps."""
 
 
-# TPU v4 has 16 MiB of VMEM per core; v5p and v6e have more.
-_SMALL_VMEM_BYTES = 16 * 1024 * 1024
-
-
-def use_gdn_jax_fallback() -> bool:
-    """Whether GDN layers run the pure-JAX conv1d + GDN instead of v3.
-
-    The GDN v3 Pallas kernel halts TPU v4 cores (RuntimeUnexpectedCoreHalt)
-    under serving load, so chips with at most 16 MiB of VMEM run the pure-JAX
-    fallback. SKYRL_GDN_V4_FALLBACK=1 forces the fallback on any chip and
-    SKYRL_GDN_V4_FALLBACK=0 forces v3.
-    """
-    override = os.environ.get("SKYRL_GDN_V4_FALLBACK", "")
-    if override in ("0", "1"):
-        return override == "1"
-    from jax.experimental.pallas import tpu as pltpu
-    try:
-        vmem_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
-    except ValueError:
-        # Not a TPU (e.g. CPU tests): keep the default kernel.
-        return False
-    return vmem_bytes <= _SMALL_VMEM_BYTES
-
-
 class GDNLinearAttentionBackend(LinearAttentionBackend):
-    """The default linear attention backend: the GDN v3 kernel, or its
-    pure-JAX fallback on TPU v4 (see use_gdn_jax_fallback)."""
+    """The default linear attention backend: the GDN v3 kernel."""
 
     def conv1d_gdn_kernel(self) -> Conv1dGDNKernel:
         # Note: imported here so that the platform, which imports this module,
         # does not load the Pallas kernels.
-        if use_gdn_jax_fallback():
-            from tpu_inference.kernels.gdn.reference import \
-                fused_conv1d_gdn_jax
-            logger.info_once(
-                "GDN layers run the pure-JAX conv1d + GDN fallback instead "
-                "of the GDN v3 kernel (TPU v4 or SKYRL_GDN_V4_FALLBACK=1).")
-            return fused_conv1d_gdn_jax.fused_conv1d_gdn
         from tpu_inference.kernels.gdn.v3 import wrapper
         return wrapper.fused_conv1d_gdn
 
