@@ -206,6 +206,16 @@ class PersistentBatchManager:
             req_id = new_req_data.req_id
             sampling_params = new_req_data.sampling_params
 
+            # vLLM sends a request resumed from preemption as a new request,
+            # with its whole history in prefill_token_ids. Keep the generated
+            # part: without it the recompute runs on wrong tokens past the
+            # prompt and the runner samples during what the scheduler treats as
+            # a prefill chunk (num_output_placeholders >= 0 assert).
+            prefill_token_ids = getattr(new_req_data, "prefill_token_ids", None)
+            prompt_len = len(new_req_data.prompt_token_ids or ())
+            output_token_ids = (list(prefill_token_ids[prompt_len:])
+                                if prefill_token_ids else [])
+
             self.requests[req_id] = CachedRequestState(
                 req_id=req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
@@ -215,7 +225,7 @@ class PersistentBatchManager:
                 generator=None,
                 block_ids=new_req_data.block_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
-                output_token_ids=[],
+                output_token_ids=output_token_ids,
                 lora_request=new_req_data.lora_request,
             )
 

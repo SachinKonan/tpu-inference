@@ -6,7 +6,7 @@ Production serves every model through the torch path (`MODEL_IMPL_TYPE=vllm`) on
 | v0.23 commit | what | on v0.32 |
 |---|---|---|
 | `a77620929` dynamic LoRA adapter management (#2707) | worker add/remove/list/pin_lora | upstream (in 0.32.0) |
-| (new) async token substitution under preemption | recompute after preemption asserted "Expected 1 token ... got 900" (Gemma) | **fixed on v0.32** (`b2fec41fc`). Open: vLLM `num_output_placeholders >= 0` assert under heavy preemption |
+| (new) async token substitution under preemption | recompute after preemption asserted "Expected 1 token ... got 900" (Gemma) | **fixed on v0.32** (`b2fec41fc`). The vLLM `num_output_placeholders >= 0` assert under heavy preemption had a deeper cause: 0.32 sends a resumed request as new, with its history in `prefill_token_ids`, and the runner dropped it (wrong tokens past the prompt, then a sampled token during a recompute chunk). `PersistentBatchManager` now keeps it |
 | `0ae6bf7aa` NaN logprob clamp | `compute_logprobs` nan_to_num | ported (`1fdf87d69`) |
 | runner.patch + thinking_budget*.py (SkyRL repo assets) | native thinking-token budget | ported (`4ecb7654b`); `allow_distributed_sampling` passed through. Fix (`498722a9f`): 0.32's `sample` carries compiler_options, illegal on a nested jit; `sample_with_budget` carries them and inlines `sample.__wrapped__` (crashed every capped request on the v6e test farm) |
 | `9b1a12a34`, `73decaf4f` Muse JAX core + JAX serving model | Muse flax path | ported (clean) |

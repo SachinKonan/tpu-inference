@@ -312,6 +312,60 @@ class TestPersistentBatchManager(unittest.TestCase):
         self.assertEqual(req.mamba_state_slot,
                          int(input_batch.mamba_state_indices_cpu[0]))
 
+    def test_update_states_keeps_output_tokens_of_resumed_new_request(self):
+        """vLLM sends a resumed request as new, with its history in
+        prefill_token_ids. Gemma 4 crash: the generated tokens were dropped, so
+        the runner saw prompt + 2 tokens where the scheduler had 1965 outputs."""
+        input_batch = InputBatch(
+            max_num_reqs=4,
+            max_model_len=16,
+            max_num_batched_tokens=16,
+            pin_memory=False,
+            vocab_size=128,
+            block_sizes=[16],
+        )
+        manager = PersistentBatchManager({},
+                                         input_batch,
+                                         encoder_cache={},
+                                         uses_mrope=False,
+                                         model_config=MagicMock(),
+                                         is_last_rank=True)
+
+        def new_request(req_id, prefill):
+            return MagicMock(req_id=req_id,
+                             prompt_token_ids=[1, 2, 3],
+                             prefill_token_ids=prefill,
+                             mm_features=[],
+                             sampling_params=SamplingParams(),
+                             pooling_params=None,
+                             block_ids=([1], ),
+                             num_computed_tokens=0,
+                             lora_request=None)
+
+        output = _make_scheduler_output(scheduled_req_ids=[])
+        output.scheduled_new_reqs = [
+            new_request("resumed", [1, 2, 3, 7, 8, 9]),
+            new_request("fresh", [1, 2, 3]),
+            new_request("no-prefill", None),
+        ]
+        output.num_scheduled_tokens = {
+            "resumed": 6,
+            "fresh": 3,
+            "no-prefill": 3
+        }
+        output.total_num_scheduled_tokens = 12
+        manager.update_states(output, None)
+
+        resumed = manager.requests["resumed"]
+        self.assertEqual(resumed.output_token_ids, [7, 8, 9])
+        self.assertEqual(resumed.num_tokens, 6)
+        index = input_batch.req_id_to_index["resumed"]
+        self.assertEqual(input_batch.token_ids_cpu[index, :6].tolist(),
+                         [1, 2, 3, 7, 8, 9])
+        self.assertEqual(int(input_batch.num_tokens[index]), 6)
+        self.assertEqual(manager.requests["fresh"].output_token_ids, [])
+        self.assertEqual(manager.requests["no-prefill"].output_token_ids, [])
+
     def test_update_states_pp_non_last_rank(self):
         """
         the current rank is not the last rank.
