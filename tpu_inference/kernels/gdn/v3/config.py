@@ -142,8 +142,11 @@ class GDNConfig:
 
     def get_vmem_limit_bytes(self) -> int:
         tpu_info = pltpu.get_tpu_info()
-        fraction = (self.WINDOWED_VMEM_FRACTION
-                    if self.window_size > 1 else self.DEFAULT_VMEM_FRACTION)
+        # TPU v4 (16 MiB VMEM): the 64-token mixed tile needs 11.43M for
+        # Qwen3.5-27B at TP4, over the default 11.2M limit.
+        small_vmem = tpu_info.vmem_capacity_bytes <= 16 * 1024 * 1024
+        fraction = (self.WINDOWED_VMEM_FRACTION if self.window_size > 1
+                    or small_vmem else self.DEFAULT_VMEM_FRACTION)
         return int(fraction * tpu_info.vmem_capacity_bytes)
 
     def get_scratch_shape_dict(self) -> dict[str, Any]:

@@ -6,6 +6,7 @@ Production serves every model through the torch path (`MODEL_IMPL_TYPE=vllm`) on
 | v0.23 commit | what | on v0.32 |
 |---|---|---|
 | `a77620929` dynamic LoRA adapter management (#2707) | worker add/remove/list/pin_lora | upstream (in 0.32.0) |
+| (new) async token substitution under preemption | recompute after preemption asserted "Expected 1 token ... got 900" (Gemma) | **fixed on v0.32** (`b2fec41fc`). Open: vLLM `num_output_placeholders >= 0` assert under heavy preemption |
 | `0ae6bf7aa` NaN logprob clamp | `compute_logprobs` nan_to_num | ported (`1fdf87d69`) |
 | runner.patch + thinking_budget*.py (SkyRL repo assets) | native thinking-token budget | ported (`4ecb7654b`); `allow_distributed_sampling` passed through. Fix (`498722a9f`): 0.32's `sample` carries compiler_options, illegal on a nested jit; `sample_with_budget` carries them and inlines `sample.__wrapped__` (crashed every capped request on the v6e test farm) |
 | `9b1a12a34`, `73decaf4f` Muse JAX core + JAX serving model | Muse flax path | ported (clean) |
@@ -24,12 +25,16 @@ Production serves every model through the torch path (`MODEL_IMPL_TYPE=vllm`) on
 `b7ff9dc7e` pieces:
 - `USE_JAX_RAGGED_CONV1D` (v4 Qwen: the old Pallas conv1d failed on v4): not ported. 0.32 replaced the separate
   conv1d call with a fused conv1d + GDN kernel (`kernels.gdn.v3`, `GDNLinearAttentionBackend`); the knob has no
-  call site. On v4 the fused kernel's 64-token prefill/mixed tile overran scoped VMEM (11.43M vs 11.2M,
-  CompileTimeScopedVmemOom, bundle v46); chips with <= 16 MiB VMEM now use a 32-token mixed tile (`0b45efb76`).
+  call site. On v4 the fused kernel needs two settings, both v4-only: a 0.9 VMEM limit (its 64-token mixed tile needs
+  11.43M against the default 11.2M) and decode tile 1 (the default tile of 4 halts a core under load:
+  RuntimeUnexpectedCoreHalt, then SLICE_FAILURE). Four full benchmark rounds on the OD v4-64 ran clean, at v0.23's
+  throughput. A pure-JAX replacement kernel (e55a5f4f0) worked but ran 11-14% slower and was reverted.
 - RPA v3 default block sizes have no `tpu_version=4` case on 0.32: ported (`966498714`). Without it the v4 AOT
   lower failed, and the warmup fallback then died on LoRA metadata leaked by the failed trace; `step_fun_impl`
   now restores LoRA metadata in a `finally` (`f75c0eb7f`).
-- batched RPA bkv_sz / VMEM-fit fixes (Muse uses `USE_BATCHED_RPA_KERNEL`): pending a Muse v0.32 farm test.
+- batched RPA bkv_sz / VMEM-fit fixes: not ported. Do not use `USE_BATCHED_RPA_KERNEL` with prefix caching on v0.32: the
+  second sample of an n>1 request reads the wrong context after a partial hit during chunked prefill (Muse on v4, 9/24
+  requests; v0.23 0/24; batched off 0/24 and as fast). SkyRL's config refuses the combination.
 - `CUSTOM_NUM_TOKENS_BUCKETS`, `SERIALIZE_MODEL_AND_SAMPLING`: not ported, no profile sets them.
 - Gemma 4 `quantize_kv` layout workaround: not ported, it is in the JAX Gemma model; Gemma serves via the torch path.
 - fp32 logits only with logprobs, host-side metadata unpack: not ported (precompile / performance only; 0.32
